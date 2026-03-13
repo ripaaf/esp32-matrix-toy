@@ -1,4 +1,4 @@
-# KaniOS (Ripaaf) — ESP32 Smart Gadget OS
+# KaniOS — ESP32 Smart Gadget OS
 
 **KaniOS** (juga dikenal sebagai **Ripaaf**) adalah sistem operasi *custom* berbasis ESP32 untuk *smart gadget* portabel. Perangkat ini menggabungkan fitur hiburan (*game*, musik, animasi), alat utilitas (kalkulator, *timer*, *stopwatch*), hingga *network security tools* (*Deauther*, *Spoofer*, *Jammer*) dalam satu antarmuka yang interaktif.
 
