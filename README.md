@@ -1,118 +1,118 @@
 # KaniOS — ESP32S3 Matrix Smart Gadget OS
 
-**KaniOS** (juga dikenal sebagai **Ripaaf**) adalah sistem operasi *custom* berbasis ESP32 untuk *smart gadget* portabel. Perangkat ini menggabungkan fitur hiburan (*game*, musik, animasi), alat utilitas (kalkulator, *timer*, *stopwatch*), hingga *network security tools* (*Deauther*, *Spoofer*, *Jammer*) dalam satu antarmuka yang interaktif.
+**KaniOS** is a custom ESP32S3-based operating system for a portable smart gadget. It combines entertainment features (games, music, animations), utility tools (calculator, timer, stopwatch), and network security tools (Deauther, Spoofer, Jammer) in one interactive interface.
 
-## ✨ Fitur Utama
+## ✨ Key Features
 
-- **Antarmuka Berbasis Menu (UI):** Navigasi simpel dan responsif menggunakan 3 tombol fisik (Up, Down, OK).
-- **Aplikasi & Alat (Tools):**
-  - Kalkulator, Stopwatch, & Timer.
-  - Lampu Senter (memanfaatkan LED Matrix).
-  - **Penetration Testing Tools:** WiFi Scanner & Deauther (WiFi Killer), Apple BLE Spoofer, BLE Monitor, dan 2.4GHz RF Jammer (**menggunakan modul NRF24 opsional**).
-  - **File Explorer:** Kelola, lihat, dan hapus file langsung dari perangkat.
-  - **Note Editor:** Buat dan putar nada/musik *buzzer* secara langsung (*on-device*).
-- **Game Berbasis Gyro (IMU):**
+- **Menu-Based UI:** Simple, responsive navigation using 3 physical buttons (Up, Down, OK).
+- **Apps & Tools:**
+  - Calculator, Stopwatch, and Timer.
+  - Flashlight (uses the LED matrix).
+  - **Penetration Testing Tools:** WiFi Scanner & Deauther (WiFi Killer), Apple BLE Spoofer, BLE Monitor, and a 2.4GHz RF Jammer (**requires an optional NRF24 module**).
+  - **File Explorer:** Manage, view, and delete files directly on the device.
+  - **Note Editor:** Create and play buzzer tones/music directly on-device.
+- **Gyro/IMU-Based Games:**
   - *Space Gyro* (Shooter)
   - *Gyro Tetris*
   - *Pong* (vs AI)
-  - *Water Simulation* (simulasi fisika air di LED Matrix menggunakan IMU)
-- **Media Player:** Penampil gambar BMP dan pemutar animasi GIF.
-- **Web Control Panel:** Web server bawaan untuk mengontrol perangkat via *browser* HP/PC (upload gambar, menggambar di LED matrix, dan pengaturan jarak jauh).
-- **Kustomisasi Lengkap:** Pengaturan kecerahan layar, LED, volume *buzzer*, *sleep mode*, dan zona waktu (UTC).
+  - *Water Simulation* (water physics simulation on the LED matrix using the IMU)
+- **Media Player:** BMP image viewer and GIF animation player.
+- **Web Control Panel:** Built-in web server to control the device via phone/PC browser (upload images, draw on the LED matrix, remote settings).
+- **Full Customization:** Screen brightness, LED brightness, buzzer volume, sleep mode, and timezone (UTC) settings.
 
 ---
 
-## 🛠️ Persyaratan Perangkat Keras (Hardware)
+## 🛠️ Hardware Requirements
 
-- **Microcontroller:** ESP32 (support LittleFS)
-- **Layar:** TFT ST7789 (240x240 pixel) via antarmuka SPI
-- **LED Matrix:** WS2812B 8x8 (64 LED)
+- **Microcontroller:** ESP32 (LittleFS supported)
+- **Display:** TFT ST7789 (240x240) via SPI
+- **LED Matrix:** WS2812B 8x8 (64 LEDs)
 - **IMU Sensor:** QMI8658 (Accelerometer & Gyroscope) via I2C
-- **Buzzer:** Modul Buzzer Pasif/Aktif
-- **Tombol:** 3x Push Button (Up, Down, OK) dengan konfigurasi `INPUT_PULLUP`
-- **Opsional:** Modul NRF24L01+ (**hanya dibutuhkan jika ingin menggunakan fitur 2.4GHz RF Jammer**)
+- **Buzzer:** Passive/active buzzer module
+- **Buttons:** 3x push buttons (Up, Down, OK) using `INPUT_PULLUP`
+- **Optional:** NRF24L01+ module (**only needed for the 2.4GHz RF Jammer feature**)
 
-### 📌 Dokumentasi Konfigurasi Pin (Pinout)
+### 📌 Pin Configuration (Pinout)
 
-Berikut adalah pemetaan pin lengkap sesuai dengan *source code*. Pastikan pengkabelan (*wiring*) sesuai dengan tabel di bawah ini:
+Below is the full pin mapping according to the source code. Make sure your wiring matches this table:
 
-| Modul / Komponen | Pin di ESP32 | Keterangan Tambahan |
+| Module / Component | ESP32 Pin | Additional Notes |
 | :--- | :---: | :--- |
-| **Layar TFT (ST7789)** |  |  |
+| **TFT Display (ST7789)** |  |  |
 | `TFT_DC` (Data/Command) | 34 |  |
 | `TFT_RST` (Reset) | 35 |  |
-| `TFT_MOSI` (SDA) | 36 | Sambungkan ke pin SDA/DIN pada layar |
-| `TFT_SCLK` (SCL) | 37 | Sambungkan ke pin SCL/CLK pada layar |
-| `TFT_BLK` (Backlight) | 33 | Untuk mengontrol kecerahan layar |
-| `TFT_CS` (Chip Select) | -1 | *Unused / tied to GND* |
+| `TFT_MOSI` (SDA) | 36 | Connect to SDA/DIN on the display |
+| `TFT_SCLK` (SCL) | 37 | Connect to SCL/CLK on the display |
+| `TFT_BLK` (Backlight) | 33 | Used to control display brightness |
+| `TFT_CS` (Chip Select) | -1 | Unused / tied to GND |
 | **LED Matrix (WS2812)** |  |  |
-| `RGB_CONTROL_PIN` | 14 | Sambungkan ke pin DIN (Data In) matrix |
-| **Sensor IMU (QMI8658)** |  |  |
-| `I2C_SDA` | 11 | Jalur Data I2C |
-| `I2C_SCL` | 12 | Jalur Clock I2C |
-| **Tombol (Push Buttons)** |  | Menggunakan internal pull-up |
-| `BTN_UP_PIN` | 38 | Tombol navigasi Atas |
-| `BTN_DOWN_PIN` | 39 | Tombol navigasi Bawah |
-| `BTN_OK_PIN` | 40 | Tombol Pilih / Konfirmasi / Kembali |
+| `RGB_CONTROL_PIN` | 14 | Connect to the matrix DIN (Data In) |
+| **IMU Sensor (QMI8658)** |  |  |
+| `I2C_SDA` | 11 | I2C data line |
+| `I2C_SCL` | 12 | I2C clock line |
+| **Buttons (Push Buttons)** |  | Uses internal pull-up |
+| `BTN_UP_PIN` | 38 | Up navigation button |
+| `BTN_DOWN_PIN` | 39 | Down navigation button |
+| `BTN_OK_PIN` | 40 | Select / confirm / back button |
 | **Buzzer** |  |  |
-| `BUZZER_PIN` | 1 | Sambungkan ke modul *buzzer* |
-| **Modul NRF24L01+** |  | **[OPSIONAL]** |
+| `BUZZER_PIN` | 1 | Connect to the buzzer module |
+| **NRF24L01+ Module** |  | **[OPTIONAL]** |
 | `NRF_CE_PIN` | 15 | Chip Enable |
 | `NRF_CSN_PIN` | 16 | Chip Select Not |
 
-> Catatan: Modul **NRF24** juga membutuhkan koneksi ke jalur **SPI standar ESP32** untuk **MISO, MOSI, dan SCK** jika diaktifkan. Jika modul tidak dipasang, fitur Jammer akan otomatis menampilkan peringatan **"NO NRF24 MODULE!"**.
+> **Note:** The **NRF24** module also needs the ESP32 standard SPI lines (**MISO, MOSI, SCK**) if enabled. If the module is not installed, the jammer feature will automatically show the warning **"NO NRF24 MODULE!"**.
 
 ---
 
-## 💻 Kebutuhan Perangkat Lunak (Dependencies)
+## 💻 Software Requirements (Dependencies)
 
-Pastikan kamu telah menginstal *library* berikut di Arduino IDE atau PlatformIO sebelum melakukan kompilasi:
+Install these libraries in Arduino IDE or PlatformIO before compiling:
 
-- `WiFi`, `WebServer`, `LittleFS`, `Wire`, `SPI` (bawaan core ESP32)
+- `WiFi`, `WebServer`, `LittleFS`, `Wire`, `SPI` (built into the ESP32 core)
 - Adafruit GFX Library
 - Adafruit ST7735 and ST7789 Library
 - FastLED
 - AnimatedGIF
-- WiFiManager (digunakan saat setup WiFi pertama kali)
-- RF24 (**opsional**, untuk fitur Jammer. Kode otomatis mendeteksi jika *library* ini tidak ada)
+- WiFiManager (used during first WiFi setup)
+- RF24 (**optional**, for the jammer feature; the code can detect if this library is missing)
 
 ---
 
-## 🚀 Cara Instalasi
+## 🚀 Installation Guide
 
-1. **Clone Repository:**
+1. **Clone the Repository:**
    ```bash
    git clone https://github.com/username/KaniOS.git
    cd KaniOS
    ```
 
-2. **Siapkan Memori Internal (LittleFS):**  
-   Sistem ini membutuhkan file sistem untuk menyimpan gambar, konfigurasi, dan catatan. Gunakan plugin **ESP32 LittleFS Data Upload** di Arduino IDE untuk mengunggah folder `data/` ke flash memory ESP32.
+2. **Prepare Internal Storage (LittleFS):**  
+   The system needs a filesystem for images, configs, and notes. Use the **ESP32 LittleFS Data Upload** plugin in Arduino IDE to upload the `data/` folder to the ESP32 flash.
 
-3. **Kompilasi dan Upload Kode:**
-   - Pilih board ESP32 yang kamu gunakan di Arduino IDE.
-   - Karena programnya cukup besar, atur skema partisi minimal ke **No OTA (2MB APP / 2MB SPIFFS)**.
-   - Klik **Upload**.
+3. **Compile and Upload the Code:**
+   - Select your ESP32 board in Arduino IDE.
+   - Since the program is large, set the partition scheme to at least **No OTA (2MB APP / 2MB SPIFFS)**.
+   - Click **Upload**.
 
-4. **Setup Awal (WiFi):**
-   - Nyalakan perangkat. Jika kredensial WiFi kosong, perangkat akan memancarkan Access Point bernama **Ripa-Setup**.
-   - Sambungkan HP/PC kamu ke AP tersebut dan buka alamat **192.168.4.1** di browser.
-   - Masukkan nama dan password WiFi lokal kamu, lalu simpan. ESP32 akan reboot otomatis dan masuk ke antarmuka utama KaniOS.
-
----
-
-## 🎮 Cara Penggunaan
-
-- **Navigasi Dasar:** Gunakan tombol **UP** dan **DOWN** untuk menggulir daftar menu. Tekan **OK** untuk memilih.
-- **Fungsi Kembali (Back):** Tekan dan tahan tombol **OK** selama ~1 detik di layar mana pun untuk membatalkan aksi, kembali ke menu sebelumnya, atau keluar dari aplikasi/game.
-- **Pengaturan Waktu:** Jam secara default mungkin tidak sesuai dengan lokasimu. Masuk ke menu **Setting > UTC** dan sesuaikan offset waktu (misalnya, pilih **+08:00** untuk waktu wilayah WITA/Makassar).
-- **Web Portal:** Alamat IP ESP32 akan selalu tampil di bilah bawah layar menu utama (misal: `192.168.x.x`). Buka IP tersebut via browser perangkat lain di jaringan yang sama untuk mengakses **Control Panel**.
-- **Upload Media:** Dari Control Panel web, kamu bisa mengunggah file gambar (**.bmp 24-bit tanpa kompresi**) atau animasi **.gif** langsung ke storage perangkat.
+4. **First-Time WiFi Setup:**
+   - Power on the device. If WiFi credentials are empty, it will create an Access Point named **Ripa-Setup**.
+   - Connect your phone/PC to that AP and open **192.168.4.1** in a browser.
+   - Enter your local WiFi name and password, then save. The ESP32 will reboot automatically and enter the KaniOS main interface.
 
 ---
 
-## ⚠️ Peringatan Hukum & Etika (Disclaimer)
+## 🎮 How to Use
 
-Project ini mencakup kode dan alat yang dapat mengganggu jaringan komunikasi (WiFi Deauther, BLE Spoofer, RF Jammer). Alat-alat ini disertakan **HANYA UNTUK TUJUAN EDUKASI DAN PENGUJIAN KEAMANAN** pada perangkat dan jaringan yang secara sah kamu miliki.
+- **Basic Navigation:** Use **UP** and **DOWN** to scroll through menu items. Press **OK** to select.
+- **Back Function:** Press and hold **OK** for ~1 second on any screen to cancel an action, return to the previous menu, or exit an app/game.
+- **Time Settings:** The clock may not match your location by default. Go to **Setting > UTC** and set the correct offset (example: choose **+08:00** for WITA/Makassar).
+- **Web Portal:** The ESP32’s IP address will always appear at the bottom bar of the main menu (example: `192.168.x.x`). Open that IP in a browser on another device on the same network to access the **Control Panel**.
+- **Upload Media:** From the web control panel, you can upload images (**.bmp 24-bit uncompressed**) or **.gif** animations directly to the device storage.
 
-Menggunakan fungsi jammer atau deauther pada jaringan publik, fasilitas umum, atau perangkat milik orang lain tanpa izin tertulis yang sah adalah tindakan **ILEGAL** dan dapat dikenakan sanksi pidana. Pembuat atau kontributor repository ini tidak bertanggung jawab atas kerugian atau pelanggaran hukum yang diakibatkan oleh penyalahgunaan software ini. Gunakan dengan bijak dan bertanggung jawab!
+---
+
+## ⚠️ Legal & Ethical Warning (Disclaimer)
+
+This project includes code/tools that can disrupt communications (WiFi Deauther, BLE Spoofer, RF Jammer). These tools are provided **ONLY FOR EDUCATIONAL PURPOSES AND AUTHORIZED SECURITY TESTING** on networks/devices you legally own or have explicit permission to test.
+
+Using jammers or deauthers on public networks, public facilities, or other people’s devices without written permission is **ILLEGAL** and may lead to criminal penalties. The creator and contributors are not responsible for damages or legal violations caused by misuse. Use responsibly.
