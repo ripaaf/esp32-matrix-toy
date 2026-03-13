@@ -102,7 +102,7 @@ Install these libraries in Arduino IDE or PlatformIO before compiling:
 
 2. **Compile and Upload the Code:**
    - Select your ESP32 board in Arduino IDE.
-   - Since the program is large, set the partition scheme to at least **No OTA (2MB APP / 2MB SPIFFS)**.
+   - Since the program is large, set the partition scheme to **No OTA (2MB APP / 2MB SPIFFS)**.
    - Click **Upload**.
 
 3. **First-Time WiFi Setup:**
