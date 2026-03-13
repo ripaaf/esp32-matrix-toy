@@ -4,10 +4,17 @@
 | --- | --- |
 | <img src="images/front.jpeg" alt="KaniOS device - front" width="420" /> | <img src="images/back.jpeg" alt="KaniOS device - back" width="420" /> |
 
-*im not using any rf anntenna because im not done implementing it also the rubber is to keep the battery in place.. :)
-
+*im not using any rf anntenna because im not done implementing it also the rubber is to keep the battery in place.. :)*
 
 **KaniOS** is a custom ESP32-based operating system for a portable smart gadget. It combines entertainment features (games, music, animations), utility tools (calculator, timer, stopwatch), and network security tools (Deauther, Spoofer, Jammer) in one interactive interface.
+
+---
+
+## 🧰 Arduino IDE Settings
+
+<img src="images/arduinosetting.png" alt="Arduino IDE settings for KaniOS" width="720" />
+
+---
 
 ## ✨ Key Features
 
