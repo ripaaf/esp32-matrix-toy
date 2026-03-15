@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -24,6 +23,8 @@
 #include <FastLED.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
+
+#include <TJpg_Decoder.h>
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -86,6 +87,7 @@ static const char *UTC_OFFSET_PATH = "/utc_off_min.txt";
 static const char *BMP_PATH = "/img.bmp";
 static const char *GIF_PATH = "/img.gif";
 static const char *MATRIX_PATH = "/matrix_rgb.bin";
+static const char *CAM_URL_PATH = "/cam_url.txt";
 
 // =========================================================
 // Limits / colors
@@ -170,6 +172,7 @@ enum AppMode : uint8_t {
   APP_VIEW_BMP,
   APP_VIEW_GIF,
   APP_GAME,
+  APP_CAMERA,
   APP_MATRIX_TEXT
 };
 
@@ -179,6 +182,44 @@ static bool uiDirty = true;
 static bool matrixIdleDirty = true;
 static uint32_t mediaStamp = 0;
 static uint32_t lastMediaStamp = 0;
+
+// BMP viewer path override
+static String bmpViewPath = BMP_PATH;
+
+// Camera / MJPEG
+static String cameraUrl = "http://192.168.25.66:4747/video";
+static String cameraBoundary = "";
+static String cameraLastError = "";
+static String cameraCapturePath = "";
+static WiFiClient cameraClient;
+static bool cameraStreamReady = false;
+static bool cameraCapturePending = false;
+static bool cameraCaptureActive = false;
+static uint32_t cameraLastConnectMs = 0;
+static uint32_t cameraLastFrameMs = 0;
+static uint8_t cameraFailCount = 0;
+static uint16_t cameraFrameW = 0;
+static uint16_t cameraFrameH = 0;
+static int16_t cameraFrameX = 0;
+static int16_t cameraFrameY = 0;
+static File cameraBmpFile;
+static uint16_t cameraCaptureNextRow = 0;
+static const uint32_t CAMERA_RECONNECT_MS = 2000;
+static const size_t CAMERA_MAX_JPEG = 120 * 1024;
+// Frame skipping / throttling to reduce CPU/TFT load (ms)
+static uint32_t cameraLastDisplayMs = 0;
+static const uint16_t CAMERA_MIN_FRAME_MS = 50; // ~20 FPS target
+static uint32_t cameraReconnectBackoffUntilMs = 0;
+static float cameraDisplayScale = 1.0f;
+static int16_t cameraDisplayW = 0;
+static int16_t cameraDisplayH = 0;
+static int16_t cameraDisplayX = 0;
+static int16_t cameraDisplayY = 0;
+static bool cameraSkipTftDuringCapture = false;
+static uint32_t cameraCaptureIndicatorUntilMs = 0;
+static uint8_t prevTftRotation = 0;
+static bool cameraRotationSaved = false;
+// `prevUiScreenBeforeView` declared after `UiScreen` enum below.
 
 // =========================================================
 // Buttons
@@ -247,6 +288,7 @@ enum UiIcon : uint8_t {
 enum MediaMenuItem : uint8_t {
   MEDIA_ITEM_BMP = 0,
   MEDIA_ITEM_GIF,
+  MEDIA_ITEM_CAMERA,
   MEDIA_ITEM_COUNT
 };
 
@@ -259,6 +301,7 @@ enum SettingsMenuItem : uint8_t {
   SETTING_ITEM_UI_SFX,
   SETTING_ITEM_SLEEP_MODE,
   SETTING_ITEM_CLOCK_VIEW,
+  SETTING_ITEM_CAM_URL,
   SETTING_ITEM_BUZZER_VOL,
   SETTING_ITEM_COUNT
 };
@@ -268,7 +311,8 @@ enum SleepMode : uint8_t {
   SLEEP_SCREEN_ONLY,
   SLEEP_LED_ONLY,
   SLEEP_STANDBY_SCREEN,
-  SLEEP_BMP_CLOCK
+  SLEEP_BMP_CLOCK,
+  SLEEP_GIF_CLOCK
 };
 
 enum ClockDisplayMode : uint8_t {
@@ -303,6 +347,7 @@ enum ToolsMenuItem : uint8_t {
 };
 
 static UiScreen uiScreen = UI_MENU;
+static UiScreen prevUiScreenBeforeView = UI_MENU;
 static int uiIndex = 0;
 static int uiEditValue = 0;
 static int uiOffsetIdx = 0;
@@ -374,6 +419,7 @@ enum TextKeyboardTarget : uint8_t {
   TEXT_TARGET_NOTE_SAVE,
   TEXT_TARGET_NOTE_LOAD,
   TEXT_TARGET_SONG_NOTE
+  ,TEXT_TARGET_CAMERA_URL
 };
 
 // Keyboard Text global
@@ -974,6 +1020,7 @@ static void tftDrawSplash();
 static void tftDrawWifiConfigHelp(const char *apName);
 static void tftDrawWifiConfigFailed();
 static bool tftDrawBmpFromFS(const char *path, int16_t x, int16_t y);
+static bool tftDrawBmpFromFSScaled(const char *path, int16_t dstX, int16_t dstY, int16_t dstW, int16_t dstH);
 static void tftDrawHeader(const char *title);
 static void tftDrawTopRightDateTime(bool clearBg);
 static uint8_t tftListFirstVisible(uint8_t selectedIndex, uint8_t itemCount, uint8_t visibleCount);
@@ -989,6 +1036,7 @@ static void tftDrawToolsMenu();
 static void tftDrawFileExplorer();
 static void tftDrawFileAction();
 static void tftDrawFileViewer();
+static void tftRedrawFileList(uint8_t selectedIndex);
 static void tftDrawMatrixTextMenu();
 static void tftDrawTextKeyboard();
 static void tftDrawNoteEditorMenu();
@@ -996,6 +1044,7 @@ static void tftDrawNoteEditorMain();
 static void tftDrawSleepStateNotice();
 static void tftDrawStandbySleepScreen();
 static void tftDrawBmpSleepClockScreen();
+static void tftDrawGifSleepClockScreen();
 static void tftRefreshSleepScreen();
 static void tftDrawCalcTool();
 static void tftDrawStopwatchTool();
@@ -1006,6 +1055,7 @@ static void tftDrawUtcScreen();
 static void tftDrawFooterIp();
 static void tftDrawBmpViewer();
 static void tftDrawGifStartOrError();
+static void tftDrawCameraStatus(const String &line1, const String &line2);
 static void tftDrawGameMenu(bool force);
 static void tftDrawShooterHud(bool force);
 static void tftDrawTetrisHud(bool force);
@@ -1145,6 +1195,21 @@ static void handleSongStopApi();
 static void handleWaterApi();
 static void handleUploadStream();
 static void handleUploadDone();
+static void handleCameraUrlApi();
+static void handleCameraCaptureApi();
+
+static bool cameraUrlLoadFromFS();
+static bool cameraUrlSaveToFS();
+static void cameraStop();
+static void cameraLoop();
+static void cameraCaptureRequest();
+static bool cameraConnectStream();
+static bool cameraReadLine(String &out, uint32_t timeoutMs);
+static bool cameraReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs);
+static bool cameraParseUrl(const String &url, String &host, uint16_t &port, String &path);
+static bool cameraBeginCapture(uint16_t w, uint16_t h);
+static void cameraEndCapture();
+static bool cameraJpgDraw(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *data);
 
 // =========================================================
 // Helpers
@@ -1723,13 +1788,14 @@ static const char *sleepModeText(SleepMode mode) {
     case SLEEP_LED_ONLY: return "LED ONLY";
     case SLEEP_STANDBY_SCREEN: return "STANDBY";
     case SLEEP_BMP_CLOCK: return "BMP CLK";
+    case SLEEP_GIF_CLOCK: return "GIF CLK";
     case SLEEP_BOTH:
     default: return "SCR+LED";
   }
 }
 
 static bool sleepModeKeepsScreenOn(SleepMode mode) {
-  return mode == SLEEP_LED_ONLY || mode == SLEEP_STANDBY_SCREEN || mode == SLEEP_BMP_CLOCK;
+  return mode == SLEEP_LED_ONLY || mode == SLEEP_STANDBY_SCREEN || mode == SLEEP_BMP_CLOCK || mode == SLEEP_GIF_CLOCK;
 }
 
 static const char *clockDisplayModeText(ClockDisplayMode mode) {
@@ -1780,6 +1846,10 @@ static void tftDrawSleepStateNotice() {
   }
   if (sleepMode == SLEEP_BMP_CLOCK) {
     tftDrawBmpSleepClockScreen();
+    return;
+  }
+  if (sleepMode == SLEEP_GIF_CLOCK) {
+    tftDrawGifSleepClockScreen();
     return;
   }
   tft.fillScreen(UI_BG);
@@ -1842,6 +1912,47 @@ static void tftDrawBmpSleepClockScreen() {
     tft.print("BMP not found");
     return;
   }
+  tftDrawSleepOverlay40(48, 86, 144, 68, 14);
+  String stamp = timeDisplayText();
+  tft.setTextColor(UI_TEXT);
+  tft.setTextSize(clockDisplayMode == CLOCK_VIEW_TIME ? 3 : 2);
+  int16_t bx, by;
+  uint16_t bw, bh;
+  tft.getTextBounds(stamp, 0, 0, &bx, &by, &bw, &bh);
+  int16_t x = (240 - (int16_t)bw) / 2;
+  if (x < 52) x = 52;
+  tft.setCursor(x, clockDisplayMode == CLOCK_VIEW_TIME ? 118 : 122);
+  tft.print(stamp);
+}
+
+static void tftDrawGifSleepClockScreen() {
+  if (!LittleFS.exists(GIF_PATH)) {
+    tftDrawStandbySleepScreen();
+    tft.setTextSize(1);
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(74, 182);
+    tft.print("GIF not found");
+    return;
+  }
+  // Try to open and draw a single frame of the GIF centered-ish on screen
+  bool ok = gif.open(GIF_PATH, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+  if (!ok) {
+    tftDrawStandbySleepScreen();
+    tft.setTextSize(1);
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(60, 182);
+    tft.print("GIF open failed");
+    return;
+  }
+  tft.fillScreen(ST77XX_BLACK);
+  int nextDelay = 0;
+  // draw at least one frame
+  (void)gif.playFrame(false, &nextDelay);
+  // close resources used by AnimatedGIF
+  gif.close();
+  if (gifFsFile) gifFsFile.close();
+
+  // overlay clock box
   tftDrawSleepOverlay40(48, 86, 144, 68, 14);
   String stamp = timeDisplayText();
   tft.setTextColor(UI_TEXT);
@@ -2017,10 +2128,11 @@ static void tftDrawMediaMenu() {
   tft.setTextColor(UI_MUTED);
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
-  const char *labels[MEDIA_ITEM_COUNT] = {"BMP Viewer", "GIF Player"};
+  const char *labels[MEDIA_ITEM_COUNT] = {"BMP Viewer", "GIF Player", "Camera"};
   String values[MEDIA_ITEM_COUNT] = {
     LittleFS.exists(BMP_PATH) ? String("READY") : String("EMPTY"),
-    LittleFS.exists(GIF_PATH) ? String("READY") : String("EMPTY")
+    LittleFS.exists(GIF_PATH) ? String("READY") : String("EMPTY"),
+    WiFi.isConnected() ? String("READY") : String("NO WIFI")
   };
   const uint8_t visibleCount = 3;
   uint8_t firstVisible = tftListFirstVisible(mediaMenuIndex, MEDIA_ITEM_COUNT, visibleCount);
@@ -2049,7 +2161,7 @@ static void tftDrawSettingsMenu() {
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
   tft.setTextWrap(false);
-  const char *labels[SETTING_ITEM_COUNT] = {"TFT Brightness", "LED Brightness", "UTC", "WiFi", "IMU", "UI Sound", "Sleep", "Clock", "Buzzer Vol"};
+  const char *labels[SETTING_ITEM_COUNT] = {"TFT Brightness", "LED Brightness", "UTC", "WiFi", "IMU", "UI Sound", "Sleep", "Clock", "Camera URL", "Buzzer Vol"};
   String values[SETTING_ITEM_COUNT] = {
     String(gTftBacklight),
     String(gBrightness),
@@ -2059,6 +2171,7 @@ static void tftDrawSettingsMenu() {
     uiSfxEnabled ? String("ON") : String("OFF"),
     String(sleepModeText(sleepMode)),
     String(clockDisplayModeText(clockDisplayMode)),
+    cameraUrl,
     String(buzzerVolume)
   };
   const uint8_t visibleCount = 5;
@@ -2347,6 +2460,16 @@ static void textKeyboardActivate() {
         noteStartPlay();
       }
       uiEnter(UI_SONG_MENU);
+    } else if (textKeyboardTarget == TEXT_TARGET_CAMERA_URL) {
+      String s = textKeyboardBuffer;
+      s.trim();
+      if (s.length() > 0) {
+        cameraUrl = s;
+        (void)cameraUrlSaveToFS();
+        cameraStop();
+      }
+      uiMarkDirty();
+      uiEnter(UI_SETTINGS_MENU);
     } else {
       String clean = textKeyboardBuffer;
       clean.trim();
@@ -2734,6 +2857,34 @@ static void tftDrawFileExplorer() {
     // Potong nama file jika terlalu panjang
     String fname = explorerFileNames[i];
     if(fname.length() > 20) fname = fname.substring(0, 17) + "...";
+    tft.print(fname);
+    tft.setCursor(160, y + 8);
+    int kb = explorerFileSizes[i] / 1024;
+    if (kb < 1 && explorerFileSizes[i] > 0) tft.print("1 KB");
+    else { tft.print(kb); tft.print(" KB"); }
+  }
+  tftDrawListScrollbar(226, 56, 140, explorerFileCount, visibleCount, firstVisible);
+}
+
+static void tftRedrawFileList(uint8_t selectedIndex) {
+  if (!fsReady) return;
+  if (explorerFileCount == 0) return;
+  const uint8_t visibleCount = 5;
+  uint8_t firstVisible = tftListFirstVisible(selectedIndex, explorerFileCount, visibleCount);
+  // clear only the list area (preserve header)
+  tft.fillRect(12, 56, 216, visibleCount * 28, UI_BG);
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= explorerFileCount) break;
+    int y = 56 + row * 28;
+    bool selected = (i == selectedIndex);
+    tft.fillRoundRect(12, y, 216, 24, 8, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 24, 8, selected ? UI_ACCENT : UI_LINE);
+    tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(18, y + 8);
+    String fname = explorerFileNames[i];
+    if (fname.length() > 20) fname = fname.substring(0, 17) + "...";
     tft.print(fname);
     tft.setCursor(160, y + 8);
     int kb = explorerFileSizes[i] / 1024;
@@ -3265,22 +3416,171 @@ static bool tftDrawBmpFromFS(const char *path, int16_t x, int16_t y) {
   return true;
 }
 
+static bool tftDrawBmpFromFSScaled(const char *path, int16_t dstX, int16_t dstY, int16_t dstW, int16_t dstH) {
+  File bmpFile = LittleFS.open(path, "r");
+  if (!bmpFile) return false;
+  auto read16 = [&](File &f) -> uint16_t {
+    uint16_t result;
+    ((uint8_t *)&result)[0] = f.read();
+    ((uint8_t *)&result)[1] = f.read();
+    return result;
+  };
+  auto read32 = [&](File &f) -> uint32_t {
+    uint32_t result;
+    ((uint8_t *)&result)[0] = f.read();
+    ((uint8_t *)&result)[1] = f.read();
+    ((uint8_t *)&result)[2] = f.read();
+    ((uint8_t *)&result)[3] = f.read();
+    return result;
+  };
+  if (read16(bmpFile) != 0x4D42) { bmpFile.close(); return false; }
+  (void)read32(bmpFile);
+  (void)read32(bmpFile);
+  uint32_t bmpImageOffset = read32(bmpFile);
+  uint32_t headerSize = read32(bmpFile);
+  int32_t bmpWidth = (int32_t)read32(bmpFile);
+  int32_t bmpHeight = (int32_t)read32(bmpFile);
+  if (read16(bmpFile) != 1) { bmpFile.close(); return false; }
+  uint16_t bmpDepth = read16(bmpFile);
+  uint32_t bmpCompression = read32(bmpFile);
+  if (headerSize < 40 || bmpDepth != 24 || bmpCompression != 0) { bmpFile.close(); return false; }
+  bool flip = true;
+  if (bmpHeight < 0) { bmpHeight = -bmpHeight; flip = false; }
+  uint32_t rowSize = (bmpWidth * 3 + 3) & ~3;
+
+  if (dstW <= 0 || dstH <= 0) { bmpFile.close(); return false; }
+
+  // clamp drawing area to TFT
+  if (dstX + dstW <= 0 || dstY + dstH <= 0 || dstX >= tft.width() || dstY >= tft.height()) {
+    bmpFile.close(); return false;
+  }
+
+  // scaling factors from dest -> source
+  float scaleX = (float)bmpWidth / (float)dstW;
+  float scaleY = (float)bmpHeight / (float)dstH;
+
+  // temporary buffer to read one source row
+  uint8_t *rowBuf = (uint8_t *)malloc(rowSize);
+  if (!rowBuf) { bmpFile.close(); return false; }
+
+  for (int dstRow = 0; dstRow < dstH; dstRow++) {
+    int srcRow = min<int>((int)(dstRow * scaleY), bmpHeight - 1);
+    uint32_t pos = bmpImageOffset + (flip ? (bmpHeight - 1 - srcRow) : srcRow) * rowSize;
+    if (bmpFile.position() != pos) bmpFile.seek(pos);
+    int got = bmpFile.read(rowBuf, rowSize);
+    if (got != (int)rowSize) { free(rowBuf); bmpFile.close(); return false; }
+
+    int drawY = dstY + dstRow;
+    if (drawY < 0 || drawY >= tft.height()) continue;
+
+    for (int dstCol = 0; dstCol < dstW; dstCol++) {
+      int srcCol = min<int>((int)(dstCol * scaleX), bmpWidth - 1);
+      int idx = srcCol * 3;
+      uint8_t b = rowBuf[idx + 0];
+      uint8_t g = rowBuf[idx + 1];
+      uint8_t r = rowBuf[idx + 2];
+      int drawX = dstX + dstCol;
+      if (drawX < 0 || drawX >= tft.width()) continue;
+      tft.drawPixel(drawX, drawY, tft.color565(r, g, b));
+    }
+    yield();
+  }
+
+  free(rowBuf);
+  bmpFile.close();
+  return true;
+}
+
 static void tftDrawBmpViewer() {
   tft.fillScreen(ST77XX_BLACK);
   int16_t bmpW = 0;
   int16_t bmpH = 0;
   int16_t drawX = 0;
   int16_t drawY = 0;
-  if (bmpGetSize(BMP_PATH, bmpW, bmpH)) {
-    drawX = (tft.width() - bmpW) / 2;
-    drawY = (tft.height() - bmpH) / 2;
+  const char *path = bmpViewPath.length() > 0 ? bmpViewPath.c_str() : BMP_PATH;
+  // support viewing JPEGs as well as BMPs
+  String sp = String(path);
+  sp.toLowerCase();
+  if (sp.endsWith(".jpg") || sp.endsWith(".jpeg")) {
+    if (!tftDrawJpgFromFS(path)) {
+      tft.setTextColor(UI_WARN);
+      tft.setTextSize(3);
+      tft.setCursor(32, 76);
+      tft.print("No JPG");
+    }
+    return;
   }
-  if (!tftDrawBmpFromFS(BMP_PATH, drawX, drawY)) {
+  if (bmpGetSize(path, bmpW, bmpH)) {
+    // compute scale to fit TFT while preserving aspect ratio
+    float sx = (float)tft.width() / (float)bmpW;
+    float sy = (float)tft.height() / (float)bmpH;
+    float s = min(sx, sy);
+    int16_t dstW = (int16_t)((float)bmpW * s + 0.5f);
+    int16_t dstH = (int16_t)((float)bmpH * s + 0.5f);
+    drawX = (tft.width() - dstW) / 2;
+    drawY = (tft.height() - dstH) / 2;
+    if (dstW != bmpW || dstH != bmpH) {
+      // scaled draw path
+      if (!tftDrawBmpFromFSScaled(path, drawX, drawY, dstW, dstH)) {
+        tft.setTextColor(UI_WARN);
+        tft.setTextSize(3);
+        tft.setCursor(32, 76);
+        tft.print("No BMP");
+      }
+      return;
+    }
+  }
+  if (!tftDrawBmpFromFS(path, drawX, drawY)) {
     tft.setTextColor(UI_WARN);
     tft.setTextSize(3);
     tft.setCursor(32, 76);
     tft.print("No BMP");
   }
+}
+
+static bool tftDrawJpgFromFS(const char *path) {
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  uint8_t *buf = (uint8_t *)malloc(sz);
+  if (!buf) { f.close(); return false; }
+  size_t got = f.read(buf, sz);
+  f.close();
+  if (got != sz) { free(buf); return false; }
+
+  uint16_t jw = 0, jh = 0;
+  if (TJpgDec.getJpgSize(&jw, &jh, buf, (uint32_t)sz) != JDR_OK) { free(buf); return false; }
+  // choose largest power-of-two scale such that decoded size is >= display size if possible
+  uint8_t scale = 1;
+  while (scale < 8) {
+    uint8_t next = scale * 2;
+    if ((jw / next) >= (uint16_t)tft.width() && (jh / next) >= (uint16_t)tft.height()) scale = next;
+    else break;
+  }
+  if (scale > 8) scale = 8;
+  TJpgDec.setJpgScale(scale);
+  uint16_t dw = jw / scale;
+  uint16_t dh = jh / scale;
+
+  // compute display scaling to fill TFT while preserving aspect ratio
+  float sx = (float)tft.width() / (float)dw;
+  float sy = (float)tft.height() / (float)dh;
+  cameraDisplayScale = min(sx, sy);
+  cameraDisplayW = (int16_t)((float)dw * cameraDisplayScale + 0.5f);
+  cameraDisplayH = (int16_t)((float)dh * cameraDisplayScale + 0.5f);
+  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
+  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
+  // keep original frame coords too for callback math
+  cameraFrameW = dw;
+  cameraFrameH = dh;
+  cameraFrameX = (int16_t)((tft.width() - (int16_t)dw) / 2);
+  cameraFrameY = (int16_t)((tft.height() - (int16_t)dh) / 2);
+
+  // draw via TJpgDec which will invoke the existing JPEG callback (`cameraJpgDraw`) that handles scaling
+  TJpgDec.drawJpg(cameraFrameX, cameraFrameY, buf, (uint32_t)sz);
+  free(buf);
+  return true;
 }
 
 static void tftDrawGifStartOrError() {
@@ -3295,6 +3595,25 @@ static void tftDrawGifStartOrError() {
     tft.setCursor(10, 225);
     tft.print("OK/OK+ back ke menu");
   }
+}
+
+static void tftDrawCameraStatus(const String &line1, const String &line2) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(UI_ACCENT);
+  tft.setCursor(12, 60);
+  tft.print("Camera");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(12, 92);
+  tft.print(line1);
+  if (line2.length() > 0) {
+    tft.setCursor(12, 110);
+    tft.print(line2);
+  }
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(12, 220);
+  tft.print("OK:capture  OK(hold):back");
 }
 
 static void tftDrawGameMenu(bool force) {
@@ -4728,12 +5047,29 @@ static void enterMode(AppMode mode) {
   appMode = mode;
   markTftDirty();
   if (mode != APP_VIEW_GIF) gifStop();
+  if (mode != APP_CAMERA) {
+    cameraStop();
+    if (cameraRotationSaved) {
+      tft.setRotation(prevTftRotation);
+      cameraRotationSaved = false;
+    }
+  } else {
+    // entering camera mode: clear backoff so connect is attempted immediately
+    cameraReconnectBackoffUntilMs = 0;
+    cameraFailCount = 0;
+    cameraLastConnectMs = 0;
+    // rotate display to orientation 3 while in camera mode
+    prevTftRotation = tft.getRotation();
+    tft.setRotation(3);
+    cameraRotationSaved = true;
+  }
 }
 
 static void exitToUi() {
   appMode = APP_UI;
   uiEnter(UI_MENU);
   gifStop();
+  cameraStop();
 }
 
 static void wifiScanAndShowList() {
@@ -5177,6 +5513,19 @@ static void uiLoop() {
     }
     return;
   }
+  if (appMode == APP_CAMERA) {
+    if (okLongPress()) {
+      uiPlayBackTone();
+      exitToUi();
+      return;
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      cameraCaptureRequest();
+      return;
+    }
+    return;
+  }
   if (appMode == APP_VIEW_BMP || appMode == APP_VIEW_GIF || appMode == APP_MATRIX_TEXT) {
     if (okShortClick() || okLongPress()) {
       uiPlayBackTone();
@@ -5186,7 +5535,15 @@ static void uiLoop() {
         matrixCommitToPixels();
         uiEnter(UI_MATRIX_TEXT_MENU);
       } else {
-        exitToUi();
+        // If we opened the image viewer from another UI screen (like File Explorer),
+        // restore that screen instead of jumping to main menu.
+        if (prevUiScreenBeforeView != UI_MENU) {
+          appMode = APP_UI;
+          uiEnter(prevUiScreenBeforeView);
+          prevUiScreenBeforeView = UI_MENU;
+        } else {
+          exitToUi();
+        }
       }
     }
     if (appMode != APP_MATRIX_TEXT) return; // Karena MATRIX_TEXT perlu diteruskan loopnya di luar uiLoop
@@ -5301,8 +5658,15 @@ static void uiLoop() {
     if (btnDown.pressEvent) { mediaMenuIndex = (mediaMenuIndex + 1) % MEDIA_ITEM_COUNT; uiPlayMoveTone(); uiMarkDirty(); }
     if (okShortClick()) {
       uiPlayOkTone();
-      if (mediaMenuIndex == MEDIA_ITEM_BMP) enterMode(APP_VIEW_BMP);
-      else enterMode(APP_VIEW_GIF);
+        if (mediaMenuIndex == MEDIA_ITEM_BMP) {
+        bmpViewPath = BMP_PATH;
+        prevUiScreenBeforeView = uiScreen;
+        enterMode(APP_VIEW_BMP);
+      } else if (mediaMenuIndex == MEDIA_ITEM_GIF) {
+        enterMode(APP_VIEW_GIF);
+      } else if (mediaMenuIndex == MEDIA_ITEM_CAMERA) {
+        enterMode(APP_CAMERA);
+      }
       return;
     }
   } else if (uiScreen == UI_SETTINGS_MENU) {
@@ -5336,6 +5700,16 @@ static void uiLoop() {
           clockDisplayMode = (ClockDisplayMode)(((int)clockDisplayMode + 1) % 3);
           (void)clockDisplaySaveToFS();
           uiMarkDirty();
+          return;
+        case SETTING_ITEM_CAM_URL:
+          // Open text keyboard initialized with current camera URL
+          textKeyboardBuffer = cameraUrl;
+          textKeyboardTarget = TEXT_TARGET_CAMERA_URL;
+          textKeyboardMode = WIFI_KEYS_ALPHA;
+          textKeyboardShift = false;
+          textKeyboardRow = 0; textKeyboardCol = 0;
+          textKeyboardUpLatched = false; textKeyboardDownLatched = false;
+          uiEnter(UI_MATRIX_TEXT_KEYBOARD);
           return;
         case SETTING_ITEM_BUZZER_VOL:
           buzzerVolume = (buzzerVolume + 1) % 11;
@@ -5540,8 +5914,23 @@ static void uiLoop() {
       return;
     }
   } else if (uiScreen == UI_FILE_EXPLORER) {
-    if (btnUp.pressEvent) { explorerListIndex = (explorerListIndex == 0) ? (explorerFileCount == 0 ? 0 : explorerFileCount - 1) : (explorerListIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
-    if (btnDown.pressEvent) { if(explorerFileCount>0) explorerListIndex = (explorerListIndex + 1) % explorerFileCount; uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnUp.pressEvent) {
+      if (explorerFileCount > 0) {
+        uint8_t prev = explorerListIndex;
+        explorerListIndex = (explorerListIndex == 0) ? (explorerFileCount - 1) : (explorerListIndex - 1);
+        uiPlayMoveTone();
+        // redraw only the list area to avoid a full-screen header clear
+        tftRedrawFileList(explorerListIndex);
+      }
+    }
+    if (btnDown.pressEvent) {
+      if (explorerFileCount > 0) {
+        uint8_t prev = explorerListIndex;
+        explorerListIndex = (explorerListIndex + 1) % explorerFileCount;
+        uiPlayMoveTone();
+        tftRedrawFileList(explorerListIndex);
+      }
+    }
     if (okShortClick()) {
       uiPlayOkTone();
       if(explorerFileCount > 0) {
@@ -5557,7 +5946,14 @@ static void uiLoop() {
       uiPlayOkTone();
       if (uiIndex == 1) { // View
         String p = explorerFileNames[explorerListIndex];
-        if (p.endsWith(".txt")) {
+        String pl = p;
+        pl.toLowerCase();
+        if (pl.endsWith(".bmp") || pl.endsWith(".jpg") || pl.endsWith(".jpeg")) {
+          bmpViewPath = p;
+          prevUiScreenBeforeView = uiScreen;
+          enterMode(APP_VIEW_BMP);
+          return;
+        } else if (pl.endsWith(".txt")) {
           fileViewerLoadFromPath(p);
           uiEnter(UI_FILE_VIEWER);
           return;
@@ -5986,7 +6382,7 @@ static void handleStatus() {
   String json = "{";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
-  json += "\"mode\":\"" + String(appMode == APP_UI ? "ui" : (appMode == APP_VIEW_BMP ? "image" : (appMode == APP_VIEW_GIF ? "gif" : "game"))) + "\",";
+  json += "\"mode\":\"" + String(appMode == APP_UI ? "ui" : (appMode == APP_VIEW_BMP ? "image" : (appMode == APP_VIEW_GIF ? "gif" : (appMode == APP_CAMERA ? "cam" : "game")))) + "\",";
   json += "\"tftSleeping\":" + String(tftSleeping ? "true" : "false") + ",";
   json += "\"tftBacklight\":" + String(gTftBacklight) + ",";
   json += "\"gif\":{\"playing\":" + String(gifPlaying ? "true" : "false") + "},";
@@ -6000,7 +6396,12 @@ static void handleStatus() {
   json += "\"gameView\":\"" + String(gameView == GAME_VIEW_MENU ? "menu" : (gameView == GAME_VIEW_SHOOTER ? "shooter" : (gameView == GAME_VIEW_TETRIS ? "tetris" : (gameView == GAME_VIEW_PONG ? "pong" : "water")))) + "\",";
   json += "\"level\":" + String(game.level) + ",";
   json += "\"score\":" + String(game.score) + ",";
-  json += "\"hp\":" + String(game.hp);
+  json += "\"hp\":" + String(game.hp) + ",";
+  json += "\"cam\":{";
+  json += "\"connected\":" + String(cameraStreamReady ? "true" : "false") + ",";
+  json += "\"url\":\"" + jsonEscape(cameraUrl) + "\",";
+  json += "\"lastError\":\"" + jsonEscape(cameraLastError) + "\"";
+  json += "}";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -6011,6 +6412,7 @@ static void handleModeApi() {
   if (s == "ui") exitToUi();
   else if (s == "image") enterMode(APP_VIEW_BMP);
   else if (s == "gif") enterMode(APP_VIEW_GIF);
+  else if (s == "cam") enterMode(APP_CAMERA);
   else if (s == "game") gameEnterMenu();
   else { server.send(400, "text/plain", "bad"); return; }
   server.send(200, "text/plain", "OK");
@@ -6137,6 +6539,74 @@ static void handleWaterApi() {
   } else server.send(400, "text/plain", "bad");
 }
 
+static void handleCameraUrlApi() {
+  if (server.hasArg("set")) {
+    cameraUrl = server.arg("set");
+    cameraUrl.trim();
+    if (cameraUrl.length() == 0) {
+      server.send(400, "text/plain", "empty");
+      return;
+    }
+    (void)cameraUrlSaveToFS();
+    cameraStop();
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+  server.send(200, "text/plain", cameraUrl);
+}
+
+static void handleCameraCaptureApi() {
+  if (appMode != APP_CAMERA) {
+    server.send(409, "text/plain", "NOT_IN_CAMERA_MODE");
+    return;
+  }
+  cameraCaptureRequest();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleFilesApi() {
+  if (!fsReady) { server.send(500, "application/json", "[]"); return; }
+  String json = "[";
+  bool first = true;
+  File root = LittleFS.open("/");
+  if (root && root.isDirectory()) {
+    root.rewindDirectory();
+    File file = root.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        String name = String(file.name());
+        String lower = name;
+        lower.toLowerCase();
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".bmp") || lower.endsWith(".gif")) {
+          if (!first) json += ",";
+          json += "\"" + name + "\"";
+          first = false;
+        }
+      }
+      file = root.openNextFile();
+    }
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+static void handleFileServe() {
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
+  String path = server.arg("path");
+  if (!path.startsWith("/")) path = "/" + path;
+  if (!LittleFS.exists(path)) { server.send(404, "text/plain", "not found"); return; }
+  File f = LittleFS.open(path, "r");
+  if (!f) { server.send(500, "text/plain", "open failed"); return; }
+  String lower = path; lower.toLowerCase();
+  String ct = "application/octet-stream";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) ct = "image/jpeg";
+  else if (lower.endsWith(".bmp")) ct = "image/bmp";
+  else if (lower.endsWith(".gif")) ct = "image/gif";
+  else if (lower.endsWith(".png")) ct = "image/png";
+  server.streamFile(f, ct);
+  f.close();
+}
+
 
 typedef struct {
   uint8_t frame_control[2] = { 0xC0, 0x00 };
@@ -6258,20 +6728,510 @@ static void handleUploadDone() {
   server.send(303);
 }
 
+static bool cameraUrlSaveToFS() {
+  if (!fsReady) return false;
+  File f = LittleFS.open(CAM_URL_PATH, "w");
+  if (!f) return false;
+  f.print(cameraUrl);
+  f.close();
+  return true;
+}
+
+static bool cameraUrlLoadFromFS() {
+  if (!fsReady) return false;
+  if (!LittleFS.exists(CAM_URL_PATH)) return false;
+  File f = LittleFS.open(CAM_URL_PATH, "r");
+  if (!f) return false;
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  if (s.length() == 0) return false;
+  cameraUrl = s;
+  return true;
+}
+
+static void cameraStop() {
+  if (cameraBmpFile) cameraBmpFile.close();
+  if (cameraClient.connected()) cameraClient.stop();
+  // fully reset client object to clear any stale state
+  cameraClient = WiFiClient();
+  cameraStreamReady = false;
+  cameraBoundary = "";
+  cameraCaptureActive = false;
+  cameraCapturePending = false;
+  cameraLastConnectMs = 0;
+  cameraLastFrameMs = 0;
+  cameraLastDisplayMs = 0;
+  // don't clear fail count here so callers can set backoff when appropriate
+}
+
+static void cameraCaptureRequest() {
+  cameraCapturePending = true;
+}
+
+static bool cameraParseUrl(const String &url, String &host, uint16_t &port, String &path) {
+  if (!url.startsWith("http://")) return false;
+  String rest = url.substring(7);
+  int slash = rest.indexOf('/');
+  String hostPort = (slash >= 0) ? rest.substring(0, slash) : rest;
+  path = (slash >= 0) ? rest.substring(slash) : "/";
+  int colon = hostPort.indexOf(':');
+  if (colon >= 0) {
+    host = hostPort.substring(0, colon);
+    port = (uint16_t)hostPort.substring(colon + 1).toInt();
+  } else {
+    host = hostPort;
+    port = 80;
+  }
+  return host.length() > 0 && port > 0;
+}
+
+static bool cameraReadLine(String &out, uint32_t timeoutMs) {
+  out = "";
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    while (cameraClient.available()) {
+      char c = (char)cameraClient.read();
+      if (c == '\n') return true;
+      if (c != '\r') out += c;
+    }
+    delay(1);
+  }
+  return false;
+}
+
+static bool cameraReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs) {
+  size_t got = 0;
+  uint32_t start = millis();
+  while (got < len && millis() - start < timeoutMs) {
+    int avail = cameraClient.available();
+    if (avail > 0) {
+      int toRead = (int)min<size_t>((size_t)avail, len - got);
+      int readNow = cameraClient.read(buf + got, toRead);
+      if (readNow > 0) got += (size_t)readNow;
+    } else {
+      delay(1);
+    }
+  }
+  return got == len;
+}
+
+static bool cameraBeginCapture(uint16_t w, uint16_t h) {
+  if (!fsReady) return false;
+  cameraCapturePath = String("/cam_") + String(millis()) + ".bmp";
+  if (LittleFS.exists(cameraCapturePath)) LittleFS.remove(cameraCapturePath);
+  cameraBmpFile = LittleFS.open(cameraCapturePath, "w");
+  if (!cameraBmpFile) return false;
+
+  uint32_t rowSize = (w * 3 + 3) & ~3;
+  uint32_t imageSize = rowSize * h;
+  uint32_t fileSize = 54 + imageSize;
+
+  uint8_t header[54] = {0};
+  header[0] = 'B'; header[1] = 'M';
+  header[2] = (uint8_t)(fileSize); header[3] = (uint8_t)(fileSize >> 8);
+  header[4] = (uint8_t)(fileSize >> 16); header[5] = (uint8_t)(fileSize >> 24);
+  header[10] = 54;
+  header[14] = 40;
+  header[18] = (uint8_t)(w); header[19] = (uint8_t)(w >> 8);
+  header[20] = (uint8_t)(w >> 16); header[21] = (uint8_t)(w >> 24);
+  int32_t negH = -(int32_t)h;
+  header[22] = (uint8_t)(negH); header[23] = (uint8_t)(negH >> 8);
+  header[24] = (uint8_t)(negH >> 16); header[25] = (uint8_t)(negH >> 24);
+  header[26] = 1;
+  header[28] = 24;
+  header[34] = (uint8_t)(imageSize); header[35] = (uint8_t)(imageSize >> 8);
+  header[36] = (uint8_t)(imageSize >> 16); header[37] = (uint8_t)(imageSize >> 24);
+
+  cameraBmpFile.write(header, sizeof(header));
+  cameraCaptureActive = true;
+  // next row to write in BMP (top-down). We'll try to write rows sequentially
+  // to avoid expensive seeks when decoder provides rows in order.
+  cameraCaptureNextRow = 0;
+  return true;
+}
+
+static void cameraEndCapture() {
+  if (cameraBmpFile) cameraBmpFile.close();
+  cameraCaptureActive = false;
+  if (cameraCapturePath.length() > 0) {
+    bmpViewPath = cameraCapturePath;
+    mediaStamp++;
+  }
+}
+
+static bool cameraJpgDraw(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *data) {
+  if (!data) return true;
+  int16_t drawX = x;
+  int16_t drawY = y;
+  int16_t drawW = (int16_t)w;
+  int16_t drawH = (int16_t)h;
+  int16_t skipX = 0;
+  int16_t skipY = 0;
+
+  if (drawX < 0) { skipX = -drawX; drawW -= skipX; drawX = 0; }
+  if (drawY < 0) { skipY = -drawY; drawH -= skipY; drawY = 0; }
+  if (drawX + drawW > tft.width()) drawW = tft.width() - drawX;
+  if (drawY + drawH > tft.height()) drawH = tft.height() - drawY;
+  if (drawW <= 0 || drawH <= 0) return true;
+
+  for (int row = 0; row < drawH; row++) {
+    int srcRow = skipY + row;
+    if (!cameraSkipTftDuringCapture && cameraDisplayScale <= 1.01f) {
+      // fast path: 1:1 or reduced size already handled by TJpgDec scaler
+      tft.drawRGBBitmap(drawX, drawY + row, data + srcRow * w + skipX, drawW, 1);
+    } else if (!cameraSkipTftDuringCapture) {
+      // scaled drawing (nearest neighbor) to fill the display
+      for (int col = 0; col < drawW; col++) {
+        uint16_t c = data[srcRow * w + skipX + col];
+        int srcXGlobal = (x - cameraFrameX) + skipX + col;
+        int srcYGlobal = (y - cameraFrameY) + srcRow;
+        int destX = cameraDisplayX + (int)(srcXGlobal * cameraDisplayScale + 0.5f);
+        int destY = cameraDisplayY + (int)(srcYGlobal * cameraDisplayScale + 0.5f);
+        int destX2 = cameraDisplayX + (int)((srcXGlobal + 1) * cameraDisplayScale + 0.5f);
+        int destY2 = cameraDisplayY + (int)((srcYGlobal + 1) * cameraDisplayScale + 0.5f);
+        int rw = destX2 - destX; if (rw <= 0) rw = 1;
+        int rh = destY2 - destY; if (rh <= 0) rh = 1;
+        uint16_t color = c;
+        tft.fillRect(destX, destY, rw, rh, color);
+      }
+    }
+  }
+
+  if (!cameraCaptureActive || !cameraBmpFile) return true;
+  int imgX = x - cameraFrameX + skipX;
+  int imgY = y - cameraFrameY + skipY;
+  if (imgX < 0 || imgY < 0) return true;
+  if (imgX + drawW > cameraFrameW || imgY + drawH > cameraFrameH) return true;
+
+  uint32_t rowSize = (cameraFrameW * 3 + 3) & ~3;
+  static uint8_t lineBuf[240 * 3];
+  for (int row = 0; row < drawH; row++) {
+    uint16_t *src = data + (skipY + row) * w + skipX;
+    for (int col = 0; col < drawW; col++) {
+      uint16_t c = src[col];
+      uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
+      uint8_t g = (uint8_t)(((c >> 5) & 0x3F) * 255 / 63);
+      uint8_t b = (uint8_t)((c & 0x1F) * 255 / 31);
+      int idx = col * 3;
+      lineBuf[idx + 0] = b;
+      lineBuf[idx + 1] = g;
+      lineBuf[idx + 2] = r;
+    }
+    uint32_t targetRow = (uint32_t)(imgY + row);
+    if (cameraCaptureNextRow == targetRow) {
+      // file pointer should already be at the correct position (sequential)
+      cameraBmpFile.write(lineBuf, drawW * 3);
+      cameraCaptureNextRow++;
+    } else {
+      // fallback: seek and write if rows arrived out of order
+      uint32_t offset = 54 + targetRow * rowSize + (uint32_t)imgX * 3;
+      cameraBmpFile.seek(offset);
+      cameraBmpFile.write(lineBuf, drawW * 3);
+    }
+  }
+  return true;
+}
+
+static bool cameraConnectStream() {
+  if (!WiFi.isConnected()) { cameraLastError = "WiFi not connected"; return false; }
+  String host;
+  String path;
+  uint16_t port = 0;
+  if (!cameraParseUrl(cameraUrl, host, port, path)) {
+    cameraLastError = "Bad URL";
+    return false;
+  }
+  if (!cameraClient.connect(host.c_str(), port)) {
+    cameraLastError = "Connect failed";
+    return false;
+  }
+  cameraClient.print(String("GET ") + path + " HTTP/1.1\r\n" +
+                     String("Host: ") + host + "\r\n" +
+                     "Connection: keep-alive\r\n\r\n");
+
+  String line;
+  cameraBoundary = "";
+  while (cameraReadLine(line, 2000)) {
+    if (line.length() == 0) break;
+    String lower = line; lower.toLowerCase();
+    int idx = lower.indexOf("boundary=");
+    if (idx >= 0) {
+      String b = line.substring(idx + 9);
+      b.trim();
+      if (!b.startsWith("--")) b = "--" + b;
+      cameraBoundary = b;
+    }
+  }
+  if (cameraBoundary.length() == 0) {
+    cameraLastError = "No boundary";
+    cameraClient.stop();
+    return false;
+  }
+  cameraStreamReady = true;
+  cameraLastError = "";
+  return true;
+}
+
+static void cameraLoop() {
+  // enforce camera rotation while in camera mode
+  tft.setRotation(3);
+
+  if (!WiFi.isConnected()) {
+    cameraStop();
+    if (tftDirty) { tftDrawCameraStatus("WiFi not connected", ""); tftDirty = false; }
+    return;
+  }
+
+  if (!cameraStreamReady) {
+    if (millis() < cameraReconnectBackoffUntilMs) {
+      if (tftDirty) { tftDrawCameraStatus("Backoff...", ""); tftDirty = false; }
+      return;
+    }
+    if (millis() - cameraLastConnectMs >= CAMERA_RECONNECT_MS) {
+      cameraLastConnectMs = millis();
+      if (!cameraConnectStream()) {
+        if (tftDirty) { tftDrawCameraStatus("Connecting...", cameraLastError); tftDirty = false; }
+        return;
+      }
+    } else if (tftDirty) {
+      tftDrawCameraStatus("Connecting...", cameraLastError);
+      tftDirty = false;
+    }
+    return;
+  }
+
+  if (!cameraClient.connected()) {
+    cameraStop();
+    return;
+  }
+
+  if (cameraLastFrameMs > 0 && millis() - cameraLastFrameMs > 3000) {
+    cameraLastError = "Stream timeout";
+    // apply backoff before attempting reconnect
+    cameraReconnectBackoffUntilMs = millis() + 3000;
+    cameraFailCount = 0;
+    cameraStop();
+    return;
+  }
+
+  String line;
+  bool gotBoundary = false;
+  uint32_t scanStart = millis();
+  while (millis() - scanStart < 300) {
+    if (!cameraReadLine(line, 120)) break;
+    if (line.startsWith(cameraBoundary)) { gotBoundary = true; break; }
+  }
+  if (!gotBoundary) {
+    if (cameraLastFrameMs > 0 && millis() - cameraLastFrameMs > 1500) {
+      cameraLastError = "Boundary timeout";
+      cameraStop();
+    }
+    return;
+  }
+
+  int contentLength = -1;
+  while (cameraReadLine(line, 200)) {
+    if (line.length() == 0) break;
+    String lower = line; lower.toLowerCase();
+    if (lower.startsWith("content-length:")) {
+      contentLength = line.substring(15).toInt();
+    }
+  }
+  if (contentLength <= 0 || (size_t)contentLength > CAMERA_MAX_JPEG) {
+    cameraLastError = "Bad frame";
+    if (++cameraFailCount >= 3) {
+      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+      cameraStop();
+    }
+    return;
+  }
+
+  uint8_t *jpgBuf = (uint8_t *)malloc((size_t)contentLength);
+  if (!jpgBuf) {
+    cameraLastError = "No mem";
+    if (++cameraFailCount >= 3) {
+      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+      cameraStop();
+    }
+    return;
+  }
+  if (!cameraReadBytes(jpgBuf, (size_t)contentLength, 2000)) {
+    free(jpgBuf);
+    cameraLastError = "Read fail";
+    if (++cameraFailCount >= 3) {
+      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+      cameraStop();
+    }
+    return;
+  }
+
+  uint16_t w = 0, h = 0;
+  if (TJpgDec.getJpgSize(&w, &h, jpgBuf, (uint32_t)contentLength) != JDR_OK) {
+    free(jpgBuf);
+    cameraLastError = "Decode size fail";
+    if (++cameraFailCount >= 3) {
+      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+      cameraStop();
+    }
+    return;
+  }
+
+  // choose largest power-of-two scale such that decoded size is >= display size if possible
+  uint8_t scale = 1;
+  while (scale < 8) {
+    uint8_t next = scale * 2;
+    if ((w / next) >= (uint16_t)tft.width() && (h / next) >= (uint16_t)tft.height()) scale = next;
+    else break;
+  }
+  if (scale > 8) scale = 8;
+  TJpgDec.setJpgScale(scale);
+  w = w / scale;
+  h = h / scale;
+
+  cameraFrameW = w;
+  cameraFrameH = h;
+  // compute display scaling to fill TFT while preserving aspect ratio
+  float sx = (float)tft.width() / (float)w;
+  float sy = (float)tft.height() / (float)h;
+  cameraDisplayScale = min(sx, sy);
+  cameraDisplayW = (int16_t)((float)w * cameraDisplayScale + 0.5f);
+  cameraDisplayH = (int16_t)((float)h * cameraDisplayScale + 0.5f);
+  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
+  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
+  // keep original frame coords too for capture math
+  cameraFrameX = (int16_t)((tft.width() - (int16_t)w) / 2);
+  cameraFrameY = (int16_t)((tft.height() - (int16_t)h) / 2);
+
+  if (cameraCapturePending) {
+    // write JPEG directly to LittleFS (faster than BMP)
+    cameraCapturePending = false;
+    cameraCapturePath = String("/cam_") + String(millis()) + ".jpg";
+    File f = LittleFS.open(cameraCapturePath, "w");
+    if (f) {
+      f.write(jpgBuf, (size_t)contentLength);
+      f.close();
+      bmpViewPath = cameraCapturePath;
+      mediaStamp++;
+      cameraCaptureIndicatorUntilMs = millis() + 800;
+    }
+  }
+
+  // Decide whether to actually render this frame or skip it to save CPU
+  const bool forceRender = cameraCaptureActive || cameraCapturePending;
+  const bool renderAllowed = forceRender || (millis() - cameraLastDisplayMs >= CAMERA_MIN_FRAME_MS);
+
+  cameraLastFrameMs = millis();
+  cameraFailCount = 0;
+
+  if (renderAllowed) {
+    if (tftDirty) tft.fillScreen(ST77XX_BLACK);
+    TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)contentLength);
+    if (cameraCaptureActive) {
+      cameraEndCapture();
+      cameraSkipTftDuringCapture = false;
+    }
+      // draw capture indicator if active
+      if (millis() < cameraCaptureIndicatorUntilMs) {
+        // small OK badge
+        tft.fillRect(tft.width() - 18, 2, 16, 10, UI_ACCENT);
+        tft.setTextSize(1);
+        tft.setTextColor(UI_TEXT);
+        tft.setCursor(tft.width() - 16, 4);
+        tft.print("OK");
+        // draw thick white border around the camera display to make capture visible
+        if (cameraDisplayW > 8 && cameraDisplayH > 8) {
+          const uint8_t thickness = 4;
+          for (uint8_t i = 0; i < thickness; i++) {
+            if (cameraDisplayW > (int)(i*2) && cameraDisplayH > (int)(i*2))
+              tft.drawRect(cameraDisplayX + i, cameraDisplayY + i, cameraDisplayW - i*2, cameraDisplayH - i*2, UI_TEXT);
+          }
+        } else if (cameraDisplayW > 4 && cameraDisplayH > 4) {
+          tft.drawRect(cameraDisplayX, cameraDisplayY, cameraDisplayW, cameraDisplayH, UI_TEXT);
+        }
+      }
+    cameraLastDisplayMs = millis();
+    tftDirty = false;
+  } else {
+    // even if we're skipping rendering, ensure we still finish capture write
+    if (cameraCaptureActive && !renderAllowed) {
+      // decode into callback which will write rows; then finish capture
+      TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)contentLength);
+      cameraEndCapture();
+      cameraSkipTftDuringCapture = false;
+    }
+  }
+
+  free(jpgBuf);
+}
+
 static void handleRoot() {
   String html =
-R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Nana</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-slate-100 min-h-screen"><div class="max-w-6xl mx-auto p-4 md:p-6 space-y-4"><div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold">Control Panel</h1><div id="statusLine" class="text-xs md:text-sm text-slate-300">Loading...</div></div><div class="grid md:grid-cols-2 gap-4"><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs" id="badges"><div class="bg-slate-800 rounded px-2 py-1" id="ip">IP:-</div><div class="bg-slate-800 rounded px-2 py-1" id="ssid">SSID:-</div><div class="bg-slate-800 rounded px-2 py-1" id="mode">MODE:-</div><div class="bg-slate-800 rounded px-2 py-1" id="tft">TFT:-</div><div class="bg-slate-800 rounded px-2 py-1" id="song">SONG:-</div><div class="bg-slate-800 rounded px-2 py-1" id="water">WATER:-</div></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('ui')">UI</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('image')">BMP</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('gif')">GIF</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('game')">GAME</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/sleep')">TFT Sleep</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/wake')">TFT Wake</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=on')">Gyro ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=off')">Gyro OFF</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-teal-700" onclick="api('/api/song/play')">Play Song</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/song/stop')">Stop Song</button><button class="px-3 py-2 rounded bg-cyan-700" onclick="api('/api/water?set=on')">Water ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/water?set=off')">Water OFF</button></div><div class="space-y-2 text-sm"><label class="block">TFT BL: <span id="tblv">255</span></label><input id="tbl" type="range" min="0" max="255" value="255" class="w-full"/><label class="block">LED BR: <span id="brv">60</span></label><input id="br" type="range" min="0" max="255" value="60" class="w-full"/></div><form method="POST" action="/upload" enctype="multipart/form-data" class="flex flex-wrap items-center gap-2 text-sm"><input type="file" name="file" accept="image/bmp,image/gif,image/x-ms-bmp,.bmp,.gif" class="text-xs"/><button class="px-3 py-2 rounded bg-emerald-700">Upload</button></form><div class="text-xs text-slate-400" id="dbg"></div></div><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="flex flex-wrap items-center gap-2 text-sm"><label>Brush</label><input id="pick" type="color" value="#000050" class="w-10 h-10 rounded"/><button class="px-3 py-2 rounded bg-slate-700" onclick="fillAll()">Fill</button><button class="px-3 py-2 rounded bg-slate-700" onclick="clearAll()">Clear</button><button class="px-3 py-2 rounded bg-blue-700" onclick="applyNow()">Apply</button><button class="px-3 py-2 rounded bg-slate-700" onclick="saveNow()">Save</button><button class="px-3 py-2 rounded bg-slate-700" onclick="loadSaved()">Load</button></div><div class="flex flex-wrap gap-2 text-xs"><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('smiley')">:)</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('neutral')">:|</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('left')">L</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('right')">R</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('concern')">:/</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('sleepy')">Zzz</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('clear')">X</button></div><div id="mx" class="grid grid-cols-8 gap-1 w-max"></div><div id="hint" class="text-xs text-slate-300"></div></div></div></div><script>
+R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Nana</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-slate-100 min-h-screen"><div class="max-w-6xl mx-auto p-4 md:p-6 space-y-4"><div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold">Control Panel</h1><div id="statusLine" class="text-xs md:text-sm text-slate-300">Loading...</div></div><div class="grid md:grid-cols-2 gap-4"><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs" id="badges"><div class="bg-slate-800 rounded px-2 py-1" id="ip">IP:-</div><div class="bg-slate-800 rounded px-2 py-1" id="ssid">SSID:-</div><div class="bg-slate-800 rounded px-2 py-1" id="mode">MODE:-</div><div class="bg-slate-800 rounded px-2 py-1" id="tft">TFT:-</div><div class="bg-slate-800 rounded px-2 py-1" id="song">SONG:-</div><div class="bg-slate-800 rounded px-2 py-1" id="water">WATER:-</div></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('ui')">UI</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('image')">BMP</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('gif')">GIF</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">CAM</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('game')">GAME</button><a href="/gallery" class="px-3 py-2 rounded bg-slate-700 inline-flex items-center">Gallery</a></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/sleep')">TFT Sleep</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/wake')">TFT Wake</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=on')">Gyro ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=off')">Gyro OFF</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-teal-700" onclick="api('/api/song/play')">Play Song</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/song/stop')">Stop Song</button><button class="px-3 py-2 rounded bg-cyan-700" onclick="api('/api/water?set=on')">Water ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/water?set=off')">Water OFF</button></div><div class="space-y-2 text-sm"><label class="block">TFT BL: <span id="tblv">255</span></label><input id="tbl" type="range" min="0" max="255" value="255" class="w-full"/><label class="block">LED BR: <span id="brv">60</span></label><input id="br" type="range" min="0" max="255" value="60" class="w-full"/></div><form method="POST" action="/upload" enctype="multipart/form-data" class="flex flex-wrap items-center gap-2 text-sm"><input type="file" name="file" accept="image/bmp,image/gif,image/x-ms-bmp,.bmp,.gif" class="text-xs"/><button class="px-3 py-2 rounded bg-emerald-700">Upload</button></form><div class="flex flex-wrap items-center gap-2 text-sm"><input id="camurl" type="text" class="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs" placeholder="http://x.x.x.x:4747/video?240x240"/><button class="px-3 py-2 rounded bg-slate-700" onclick="setCamUrl()">Set Cam URL</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">Open Camera</button><button class="px-3 py-2 rounded bg-emerald-700" onclick="captureCam()">Capture</button></div><div class="text-xs text-slate-400" id="camstat"></div><div class="text-xs text-slate-400" id="dbg"></div></div><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="flex flex-wrap items-center gap-2 text-sm"><label>Brush</label><input id="pick" type="color" value="#000050" class="w-10 h-10 rounded"/><button class="px-3 py-2 rounded bg-slate-700" onclick="fillAll()">Fill</button><button class="px-3 py-2 rounded bg-slate-700" onclick="clearAll()">Clear</button><button class="px-3 py-2 rounded bg-blue-700" onclick="applyNow()">Apply</button><button class="px-3 py-2 rounded bg-slate-700" onclick="saveNow()">Save</button><button class="px-3 py-2 rounded bg-slate-700" onclick="loadSaved()">Load</button></div><div class="flex flex-wrap gap-2 text-xs"><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('smiley')">:)</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('neutral')">:|</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('left')">L</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('right')">R</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('concern')">:/</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('sleepy')">Zzz</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('clear')">X</button></div><div id="mx" class="grid grid-cols-8 gap-1 w-max"></div><div id="hint" class="text-xs text-slate-300"></div></div></div></div><script>
 let colors=Array(64).fill('#000000');let editing=true;const q=(id)=>document.getElementById(id);const hex=(s)=>(s||'#000000').toUpperCase();function renderMatrix(){const m=q('mx');m.innerHTML='';for(let i=0;i<64;i++){const d=document.createElement('button');d.className='w-7 h-7 rounded border border-slate-700';d.style.background=colors[i];d.onclick=()=>{colors[i]=hex(q('pick').value);editing=true;renderMatrix();};m.appendChild(d);}}
 function colorsToHex384(){return colors.map(c=>hex(c).replace('#','')).join('');}function hex384ToColors(s){if(!s||s.length!==384)return false;for(let i=0;i<64;i++)colors[i]='#'+s.slice(i*6,i*6+6).toUpperCase();return true;}
-async function api(u){await fetch(u);}async function setMode(m){await api('/api/mode?set='+m);}async function setBrushOnDevice(){const c=hex(q('pick').value).replace('#','');const r=parseInt(c.slice(0,2),16);const g=parseInt(c.slice(2,4),16);const b=parseInt(c.slice(4,6),16);await api('/api/brush?rgb='+r+','+g+','+b);}
+async function api(u){await fetch(u);}async function setMode(m){await api('/api/mode?set='+m);}async function setCamUrl(){const u=q('camurl').value.trim();if(!u)return;await fetch('/api/camera/url?set='+encodeURIComponent(u));}async function captureCam(){await api('/api/camera/capture');}async function setBrushOnDevice(){const c=hex(q('pick').value).replace('#','');const r=parseInt(c.slice(0,2),16);const g=parseInt(c.slice(2,4),16);const b=parseInt(c.slice(4,6),16);await api('/api/brush?rgb='+r+','+g+','+b);}
 function fillAll(){colors=Array(64).fill(hex(q('pick').value));editing=true;renderMatrix();}function clearAll(){colors=Array(64).fill('#000000');editing=true;renderMatrix();}
 async function applyNow(){await setBrushOnDevice();const r=await fetch('/api/matrix/setc?hex='+colorsToHex384());q('hint').textContent=r.ok?'OK':'Blocked';if(r.ok)editing=false;}async function tpl(n){await setBrushOnDevice();await api('/api/matrix/template?name='+n);await pullMatrix();}async function saveNow(){await api('/api/matrix/save');}async function loadSaved(){await api('/api/matrix/load');await pullMatrix();}async function pullMatrix(){const r=await fetch('/api/matrix/getc');const s=await r.text();if(hex384ToColors(s))renderMatrix();}
 let brT=0,tblT=0;q('br').oninput=(e)=>{q('brv').textContent=e.target.value;clearTimeout(brT);brT=setTimeout(()=>api('/api/brightness?set='+e.target.value),120);};q('tbl').oninput=(e)=>{q('tblv').textContent=e.target.value;clearTimeout(tblT);tblT=setTimeout(()=>api('/api/tft/backlight?set='+e.target.value),120);};
-async function refreshStatus(){const j=await(await fetch('/api/status')).json();q('ip').textContent='IP:'+j.ip;q('ssid').textContent='SSID:'+j.ssid;q('mode').textContent='MODE:'+(j.mode||'-').toUpperCase();q('tft').textContent='TFT:'+(j.tftSleeping?'SLEEP':'ON');q('song').textContent='SONG:'+(j.songPlaying?'PLAY':'STOP');q('water').textContent='WATER:'+(j.waterMode?'ON':'OFF');q('statusLine').textContent='Dir:'+j.dir+' Game:'+j.gameView;q('dbg').textContent='G:'+j.gyro.x.toFixed(1)+','+j.gyro.y.toFixed(1)+','+j.gyro.z.toFixed(1)+' A:'+j.accel.x.toFixed(2)+','+j.accel.y.toFixed(2)+','+j.accel.z.toFixed(2)+' T:'+j.tilt.roll.toFixed(0)+','+j.tilt.pitch.toFixed(0)+' GIF:'+j.gif.playing+' Gm:L'+j.level+'S'+j.score+'H'+j.hp;if(+q('br').value!==j.brightness){q('br').value=j.brightness;q('brv').textContent=j.brightness;}if(+q('tbl').value!==j.tftBacklight){q('tbl').value=j.tftBacklight;q('tblv').textContent=j.tftBacklight;}if(!editing&&!j.waterMode&&j.mode!=='game')await pullMatrix();}
+async function refreshStatus(){const j=await(await fetch('/api/status')).json();q('ip').textContent='IP:'+j.ip;q('ssid').textContent='SSID:'+j.ssid;q('mode').textContent='MODE:'+(j.mode||'-').toUpperCase();q('tft').textContent='TFT:'+(j.tftSleeping?'SLEEP':'ON');q('song').textContent='SONG:'+(j.songPlaying?'PLAY':'STOP');q('water').textContent='WATER:'+(j.waterMode?'ON':'OFF');q('statusLine').textContent='Dir:'+j.dir+' Game:'+j.gameView;q('dbg').textContent='G:'+j.gyro.x.toFixed(1)+','+j.gyro.y.toFixed(1)+','+j.gyro.z.toFixed(1)+' A:'+j.accel.x.toFixed(2)+','+j.accel.y.toFixed(2)+','+j.accel.z.toFixed(2)+' T:'+j.tilt.roll.toFixed(0)+','+j.tilt.pitch.toFixed(0)+' GIF:'+j.gif.playing+' Gm:L'+j.level+'S'+j.score+'H'+j.hp;if(j.cam){q('camstat').textContent='CAM:'+(j.cam.connected?'ON':'OFF')+' '+(j.cam.lastError||'');if(!document.activeElement||document.activeElement.id!=='camurl'){q('camurl').value=j.cam.url||'';}}if(+q('br').value!==j.brightness){q('br').value=j.brightness;q('brv').textContent=j.brightness;}if(+q('tbl').value!==j.tftBacklight){q('tbl').value=j.tftBacklight;q('tblv').textContent=j.tftBacklight;}if(!editing&&!j.waterMode&&j.mode!=='game')await pullMatrix();}
 renderMatrix();pullMatrix().then(()=>{editing=false;});refreshStatus();setInterval(refreshStatus,700);
 </script></body></html>)HTML";
   server.send(200, "text/html", html);
 }
+
+static void handleGallery() {
+  String html =
+R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Gallery</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-900 text-slate-100 min-h-screen"><div class="max-w-4xl mx-auto p-4"><h1 class="text-xl font-bold mb-4">Gallery</h1><div id="gallery" class="grid grid-cols-3 gap-2"></div><script>
+const q=(id)=>document.getElementById(id);
+async function fetchGallery(){try{const r=await fetch('/api/files');if(!r.ok)return;const files=await r.json();const g=q('gallery');if(!g)return;g.innerHTML='';files.forEach(f=>{const a=document.createElement('a');a.href='/view?path='+encodeURIComponent(f);a.target='_blank';a.className='block';const img=document.createElement('img');img.src='/file?path='+encodeURIComponent(f);img.alt=f;img.className='w-full h-32 object-cover rounded';a.appendChild(img);g.appendChild(a);});}catch(e){}}
+fetchGallery();setInterval(fetchGallery,5000);
+</script></div></body></html>)HTML";
+  server.send(200, "text/html", html);
+}
+
+static void handleView() {
+  if (!server.hasArg("path")) {
+    server.send(400, "text/plain", "missing path");
+    return;
+  }
+
+  String path = server.arg("path");
+
+  String html = R"rawliteral(
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>View</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+<div class="max-w-4xl mx-auto p-4">
+<a class="inline-block mb-4 px-3 py-2 rounded bg-slate-700" href="/gallery">&larr; Back</a>
+<div class="w-full bg-black flex items-center justify-center">
+<img src="/file?path=)rawliteral";
+
+  html += path;
+
+  html += R"rawliteral(" style="max-width:100%;height:auto;display:block;" alt="">
+</div>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
 
 static void doNetworkInit() {
   if (deferredInitDone) return;
@@ -6301,6 +7261,12 @@ static void doNetworkInit() {
   server.on("/api/song/play", HTTP_GET, handleSongPlayApi);
   server.on("/api/song/stop", HTTP_GET, handleSongStopApi);
   server.on("/api/water", HTTP_GET, handleWaterApi);
+  server.on("/api/camera/url", HTTP_GET, handleCameraUrlApi);
+  server.on("/api/camera/capture", HTTP_GET, handleCameraCaptureApi);
+  server.on("/api/files", HTTP_GET, handleFilesApi);
+  server.on("/file", HTTP_GET, handleFileServe);
+  server.on("/gallery", HTTP_GET, handleGallery);
+  server.on("/view", HTTP_GET, handleView);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadStream);
   server.begin();
 
@@ -6324,6 +7290,7 @@ void setup() {
     fsReady = LittleFS.begin(true);
   }
   noteEnsureDir();
+  (void)cameraUrlLoadFromFS();
   (void)wifiCredentialsLoadFromFS();
   wifiAutoConnectPending = (savedWifiSsid.length() > 0);
   (void)utcOffsetLoadFromFS();
@@ -6337,6 +7304,7 @@ void setup() {
   (void)buzzerVolLoadFromFS();
   blInit();
   tftInitDisplay();
+  TJpgDec.setCallback(cameraJpgDraw);
   tftDrawSplash();
   buttonsInit();
   matrixInit();
@@ -6436,6 +7404,7 @@ void loop() {
       }
     }
     gifStop();
+    cameraStop();
     delay(1);
     return;
   }
@@ -6500,6 +7469,7 @@ void loop() {
         tftDrawBmpViewer();
       }
       gifStop();
+      cameraStop();
     } else if (appMode == APP_VIEW_GIF) {
       if (tftDirty || mediaStamp != lastMediaStamp) {
         lastMediaStamp = mediaStamp;
@@ -6507,12 +7477,16 @@ void loop() {
         tftDrawGifStartOrError();
       }
       gifLoopStep();
+      cameraStop();
+    } else if (appMode == APP_CAMERA) {
+      cameraLoop();
     } else if (appMode == APP_UI && tftDirty) {
       tftDirty = false;
       uiDirty = true;
     }
   } else {
     gifStop();
+    cameraStop();
   }
   delay(1);
 }
