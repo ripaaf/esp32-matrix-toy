@@ -1020,6 +1020,7 @@ static void tftDrawSplash();
 static void tftDrawWifiConfigHelp(const char *apName);
 static void tftDrawWifiConfigFailed();
 static bool tftDrawBmpFromFS(const char *path, int16_t x, int16_t y);
+static bool tftDrawBmpFromFSScaled(const char *path, int16_t dstX, int16_t dstY, int16_t dstW, int16_t dstH);
 static void tftDrawHeader(const char *title);
 static void tftDrawTopRightDateTime(bool clearBg);
 static uint8_t tftListFirstVisible(uint8_t selectedIndex, uint8_t itemCount, uint8_t visibleCount);
@@ -1035,6 +1036,7 @@ static void tftDrawToolsMenu();
 static void tftDrawFileExplorer();
 static void tftDrawFileAction();
 static void tftDrawFileViewer();
+static void tftRedrawFileList(uint8_t selectedIndex);
 static void tftDrawMatrixTextMenu();
 static void tftDrawTextKeyboard();
 static void tftDrawNoteEditorMenu();
@@ -2864,6 +2866,34 @@ static void tftDrawFileExplorer() {
   tftDrawListScrollbar(226, 56, 140, explorerFileCount, visibleCount, firstVisible);
 }
 
+static void tftRedrawFileList(uint8_t selectedIndex) {
+  if (!fsReady) return;
+  if (explorerFileCount == 0) return;
+  const uint8_t visibleCount = 5;
+  uint8_t firstVisible = tftListFirstVisible(selectedIndex, explorerFileCount, visibleCount);
+  // clear only the list area (preserve header)
+  tft.fillRect(12, 56, 216, visibleCount * 28, UI_BG);
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= explorerFileCount) break;
+    int y = 56 + row * 28;
+    bool selected = (i == selectedIndex);
+    tft.fillRoundRect(12, y, 216, 24, 8, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 24, 8, selected ? UI_ACCENT : UI_LINE);
+    tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(18, y + 8);
+    String fname = explorerFileNames[i];
+    if (fname.length() > 20) fname = fname.substring(0, 17) + "...";
+    tft.print(fname);
+    tft.setCursor(160, y + 8);
+    int kb = explorerFileSizes[i] / 1024;
+    if (kb < 1 && explorerFileSizes[i] > 0) tft.print("1 KB");
+    else { tft.print(kb); tft.print(" KB"); }
+  }
+  tftDrawListScrollbar(226, 56, 140, explorerFileCount, visibleCount, firstVisible);
+}
+
 static void tftDrawFileAction() {
   tftDrawHeader("File Action");
   tft.setTextSize(1);
@@ -3386,6 +3416,81 @@ static bool tftDrawBmpFromFS(const char *path, int16_t x, int16_t y) {
   return true;
 }
 
+static bool tftDrawBmpFromFSScaled(const char *path, int16_t dstX, int16_t dstY, int16_t dstW, int16_t dstH) {
+  File bmpFile = LittleFS.open(path, "r");
+  if (!bmpFile) return false;
+  auto read16 = [&](File &f) -> uint16_t {
+    uint16_t result;
+    ((uint8_t *)&result)[0] = f.read();
+    ((uint8_t *)&result)[1] = f.read();
+    return result;
+  };
+  auto read32 = [&](File &f) -> uint32_t {
+    uint32_t result;
+    ((uint8_t *)&result)[0] = f.read();
+    ((uint8_t *)&result)[1] = f.read();
+    ((uint8_t *)&result)[2] = f.read();
+    ((uint8_t *)&result)[3] = f.read();
+    return result;
+  };
+  if (read16(bmpFile) != 0x4D42) { bmpFile.close(); return false; }
+  (void)read32(bmpFile);
+  (void)read32(bmpFile);
+  uint32_t bmpImageOffset = read32(bmpFile);
+  uint32_t headerSize = read32(bmpFile);
+  int32_t bmpWidth = (int32_t)read32(bmpFile);
+  int32_t bmpHeight = (int32_t)read32(bmpFile);
+  if (read16(bmpFile) != 1) { bmpFile.close(); return false; }
+  uint16_t bmpDepth = read16(bmpFile);
+  uint32_t bmpCompression = read32(bmpFile);
+  if (headerSize < 40 || bmpDepth != 24 || bmpCompression != 0) { bmpFile.close(); return false; }
+  bool flip = true;
+  if (bmpHeight < 0) { bmpHeight = -bmpHeight; flip = false; }
+  uint32_t rowSize = (bmpWidth * 3 + 3) & ~3;
+
+  if (dstW <= 0 || dstH <= 0) { bmpFile.close(); return false; }
+
+  // clamp drawing area to TFT
+  if (dstX + dstW <= 0 || dstY + dstH <= 0 || dstX >= tft.width() || dstY >= tft.height()) {
+    bmpFile.close(); return false;
+  }
+
+  // scaling factors from dest -> source
+  float scaleX = (float)bmpWidth / (float)dstW;
+  float scaleY = (float)bmpHeight / (float)dstH;
+
+  // temporary buffer to read one source row
+  uint8_t *rowBuf = (uint8_t *)malloc(rowSize);
+  if (!rowBuf) { bmpFile.close(); return false; }
+
+  for (int dstRow = 0; dstRow < dstH; dstRow++) {
+    int srcRow = min<int>((int)(dstRow * scaleY), bmpHeight - 1);
+    uint32_t pos = bmpImageOffset + (flip ? (bmpHeight - 1 - srcRow) : srcRow) * rowSize;
+    if (bmpFile.position() != pos) bmpFile.seek(pos);
+    int got = bmpFile.read(rowBuf, rowSize);
+    if (got != (int)rowSize) { free(rowBuf); bmpFile.close(); return false; }
+
+    int drawY = dstY + dstRow;
+    if (drawY < 0 || drawY >= tft.height()) continue;
+
+    for (int dstCol = 0; dstCol < dstW; dstCol++) {
+      int srcCol = min<int>((int)(dstCol * scaleX), bmpWidth - 1);
+      int idx = srcCol * 3;
+      uint8_t b = rowBuf[idx + 0];
+      uint8_t g = rowBuf[idx + 1];
+      uint8_t r = rowBuf[idx + 2];
+      int drawX = dstX + dstCol;
+      if (drawX < 0 || drawX >= tft.width()) continue;
+      tft.drawPixel(drawX, drawY, tft.color565(r, g, b));
+    }
+    yield();
+  }
+
+  free(rowBuf);
+  bmpFile.close();
+  return true;
+}
+
 static void tftDrawBmpViewer() {
   tft.fillScreen(ST77XX_BLACK);
   int16_t bmpW = 0;
@@ -3406,8 +3511,24 @@ static void tftDrawBmpViewer() {
     return;
   }
   if (bmpGetSize(path, bmpW, bmpH)) {
-    drawX = (tft.width() - bmpW) / 2;
-    drawY = (tft.height() - bmpH) / 2;
+    // compute scale to fit TFT while preserving aspect ratio
+    float sx = (float)tft.width() / (float)bmpW;
+    float sy = (float)tft.height() / (float)bmpH;
+    float s = min(sx, sy);
+    int16_t dstW = (int16_t)((float)bmpW * s + 0.5f);
+    int16_t dstH = (int16_t)((float)bmpH * s + 0.5f);
+    drawX = (tft.width() - dstW) / 2;
+    drawY = (tft.height() - dstH) / 2;
+    if (dstW != bmpW || dstH != bmpH) {
+      // scaled draw path
+      if (!tftDrawBmpFromFSScaled(path, drawX, drawY, dstW, dstH)) {
+        tft.setTextColor(UI_WARN);
+        tft.setTextSize(3);
+        tft.setCursor(32, 76);
+        tft.print("No BMP");
+      }
+      return;
+    }
   }
   if (!tftDrawBmpFromFS(path, drawX, drawY)) {
     tft.setTextColor(UI_WARN);
@@ -3430,15 +3551,34 @@ static bool tftDrawJpgFromFS(const char *path) {
 
   uint16_t jw = 0, jh = 0;
   if (TJpgDec.getJpgSize(&jw, &jh, buf, (uint32_t)sz) != JDR_OK) { free(buf); return false; }
+  // choose largest power-of-two scale such that decoded size is >= display size if possible
   uint8_t scale = 1;
-  while ((jw / scale) > (uint16_t)tft.width() || (jh / scale) > (uint16_t)tft.height()) scale *= 2;
+  while (scale < 8) {
+    uint8_t next = scale * 2;
+    if ((jw / next) >= (uint16_t)tft.width() && (jh / next) >= (uint16_t)tft.height()) scale = next;
+    else break;
+  }
   if (scale > 8) scale = 8;
   TJpgDec.setJpgScale(scale);
   uint16_t dw = jw / scale;
   uint16_t dh = jh / scale;
-  int16_t dx = (tft.width() - (int16_t)dw) / 2;
-  int16_t dy = (tft.height() - (int16_t)dh) / 2;
-  TJpgDec.drawJpg(dx, dy, buf, (uint32_t)sz);
+
+  // compute display scaling to fill TFT while preserving aspect ratio
+  float sx = (float)tft.width() / (float)dw;
+  float sy = (float)tft.height() / (float)dh;
+  cameraDisplayScale = min(sx, sy);
+  cameraDisplayW = (int16_t)((float)dw * cameraDisplayScale + 0.5f);
+  cameraDisplayH = (int16_t)((float)dh * cameraDisplayScale + 0.5f);
+  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
+  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
+  // keep original frame coords too for callback math
+  cameraFrameW = dw;
+  cameraFrameH = dh;
+  cameraFrameX = (int16_t)((tft.width() - (int16_t)dw) / 2);
+  cameraFrameY = (int16_t)((tft.height() - (int16_t)dh) / 2);
+
+  // draw via TJpgDec which will invoke the existing JPEG callback (`cameraJpgDraw`) that handles scaling
+  TJpgDec.drawJpg(cameraFrameX, cameraFrameY, buf, (uint32_t)sz);
   free(buf);
   return true;
 }
@@ -5774,8 +5914,23 @@ static void uiLoop() {
       return;
     }
   } else if (uiScreen == UI_FILE_EXPLORER) {
-    if (btnUp.pressEvent) { explorerListIndex = (explorerListIndex == 0) ? (explorerFileCount == 0 ? 0 : explorerFileCount - 1) : (explorerListIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
-    if (btnDown.pressEvent) { if(explorerFileCount>0) explorerListIndex = (explorerListIndex + 1) % explorerFileCount; uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnUp.pressEvent) {
+      if (explorerFileCount > 0) {
+        uint8_t prev = explorerListIndex;
+        explorerListIndex = (explorerListIndex == 0) ? (explorerFileCount - 1) : (explorerListIndex - 1);
+        uiPlayMoveTone();
+        // redraw only the list area to avoid a full-screen header clear
+        tftRedrawFileList(explorerListIndex);
+      }
+    }
+    if (btnDown.pressEvent) {
+      if (explorerFileCount > 0) {
+        uint8_t prev = explorerListIndex;
+        explorerListIndex = (explorerListIndex + 1) % explorerFileCount;
+        uiPlayMoveTone();
+        tftRedrawFileList(explorerListIndex);
+      }
+    }
     if (okShortClick()) {
       uiPlayOkTone();
       if(explorerFileCount > 0) {
