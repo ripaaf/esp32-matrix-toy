@@ -125,6 +125,42 @@ Install these libraries in Arduino IDE or PlatformIO before compiling:
 
 ---
 
+## 📷 UART Camera Link (XIAO ESP32S3 Sense -> ESP32S3 Matrix)
+
+You can now stream RGB565 camera frames over hardware UART (RX/TX) from a separate camera board to the matrix board TFT.
+
+### Files
+
+- Receiver (matrix device): `main.ino` (already supports `uart://` mode)
+- Sender (camera device): `xiao_uart_rgb_sender_simple.ino`
+
+### Wiring (minimum)
+
+- XIAO camera **TX** -> Matrix **RX pin** (default in code: `CAM_UART_RX_PIN = 44`)
+- Matrix **TX pin** -> XIAO camera **RX** (required for remote 3MP capture command)
+- **GND** XIAO -> **GND** Matrix
+
+> If your board uses different free GPIO, change these constants in both sketches:
+> - Matrix receiver: `CAM_UART_RX_PIN`, `CAM_UART_BAUD` in `main.ino`
+> - XIAO sender: `CAM_UART_TX_PIN`, `CAM_UART_BAUD` in `xiao_uart_rgb_sender_simple.ino`
+
+### How to use
+
+1. Upload `xiao_uart_rgb_sender_simple.ino` to XIAO ESP32S3 Sense.
+2. Upload updated `main.ino` to the matrix board.
+3. On matrix device set camera URL to `uart://cam` (via **Setting -> Camera URL** or web `/api/camera/url?set=uart://cam`).
+4. Open **Media -> Camera**.
+5. Press capture in camera UI to save one BMP snapshot from the latest complete UART frame.
+
+### Notes
+
+- Current UART framing is packetized line stream: frame-start, RGB565 line packets, frame-end.
+- Stream is tuned for 160x120 RGB565 over UART 921600.
+- Snapshot result in UART mode is saved as `.bmp` to LittleFS.
+- Microphone audio is not streamed yet in this implementation.
+
+---
+
 ## ⚠️ Legal & Ethical Warning (Disclaimer)
 
 This project includes code/tools that can disrupt communications (WiFi Deauther, BLE Spoofer, RF Jammer). These tools are provided **ONLY FOR EDUCATIONAL PURPOSES AND AUTHORIZED SECURITY TESTING** on networks/devices you legally own or have explicit permission to test.
